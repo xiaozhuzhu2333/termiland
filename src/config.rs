@@ -7,6 +7,8 @@ use serde::Deserialize;
 pub struct Config {
     pub ui: UiConfig,
     pub islands: IslandsConfig,
+    pub jump: JumpConfig,
+    pub commands: CommandsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -19,8 +21,8 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            left_width: 28,
-            right_width: 44,
+            left_width: 22,
+            right_width: 36,
         }
     }
 }
@@ -49,6 +51,25 @@ pub struct Island {
     pub height: Option<u16>,
     #[serde(default)]
     pub live: bool,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JumpConfig {
+    pub bookmarks: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommandsConfig {
+    pub items: Vec<CommandItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandItem {
+    pub name: Option<String>,
+    pub command: String,
 }
 
 impl Config {
@@ -93,14 +114,16 @@ mod tests {
     #[test]
     fn empty_config_uses_defaults() {
         let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.ui.left_width, 28);
-        assert_eq!(cfg.ui.right_width, 44);
+        assert_eq!(cfg.ui.left_width, 22);
+        assert_eq!(cfg.ui.right_width, 36);
         assert_eq!(cfg.islands.max, 3);
         assert!(cfg.islands.items.is_empty());
+        assert!(cfg.jump.bookmarks.is_empty());
+        assert!(cfg.commands.items.is_empty());
     }
 
     #[test]
-    fn parses_islands() {
+    fn parses_full_config() {
         let raw = r#"
 [ui]
 left_width = 30
@@ -119,6 +142,16 @@ name = "top"
 command = "top"
 height = 20
 live = true
+
+[jump]
+bookmarks = ["/var/log", "/data"]
+
+[[commands.items]]
+name = "服务状态"
+command = "systemctl status nginx"
+
+[[commands.items]]
+command = "df -h"
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.ui.left_width, 30);
@@ -127,6 +160,9 @@ live = true
         assert!(!cfg.islands.items[0].live);
         assert!(cfg.islands.items[1].live);
         assert_eq!(cfg.islands.items[1].height, Some(20));
-        assert!(cfg.islands.items[0].name.is_some());
+        assert_eq!(cfg.jump.bookmarks, ["/var/log", "/data"]);
+        assert_eq!(cfg.commands.items.len(), 2);
+        assert!(cfg.commands.items[0].name.is_some());
+        assert!(cfg.commands.items[1].name.is_none());
     }
 }

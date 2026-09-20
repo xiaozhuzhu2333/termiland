@@ -7,8 +7,24 @@ use ratatui::DefaultTerminal;
 use crate::config::Config;
 use crate::ui;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftPage {
+    Jump,
+    Commands,
+}
+
+impl LeftPage {
+    fn next(self) -> Self {
+        match self {
+            LeftPage::Jump => LeftPage::Commands,
+            LeftPage::Commands => LeftPage::Jump,
+        }
+    }
+}
+
 pub struct App {
     pub config: Config,
+    pub left_page: LeftPage,
     should_quit: bool,
 }
 
@@ -16,6 +32,7 @@ impl App {
     pub fn new(config: Config) -> Self {
         Self {
             config,
+            left_page: LeftPage::Jump,
             should_quit: false,
         }
     }
@@ -41,6 +58,7 @@ impl App {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.should_quit = true;
                 }
+                KeyCode::Tab => self.left_page = self.left_page.next(),
                 _ => {}
             }
         }

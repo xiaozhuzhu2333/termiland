@@ -1,20 +1,31 @@
 # 复制到 ~/.config/termiland/config.toml 后按需修改，所有字段均可省略
 
 [ui]
-left_width = 28   # 左栏宽度（列）
-right_width = 44  # 右栏宽度（列）
+left_width = 22   # 左栏宽度（列）
+right_width = 36  # 右栏宽度（列）
 
 [islands]
 max = 3  # 岛数量上限
 
 [[islands.items]]
-name = "history"                  # 边框标题（可省略）
+name = "history"                  # 岛边框标题（可省略，缺省用命令本身）
 command = "tail -n 30 $HISTFILE"  # 岛内运行的命令
-height = 12                       # 岛高度（行，可省略，省略则平分）
-# live = false                   # 实时刷新开关（默认 false：中栏执行命令后刷新）
+height = 12                       # 岛高度（行，含边框；可省略，省略则平分剩余空间）
+# live = false                   # 实时开关初始状态（默认 false：中栏执行命令后刷新；运行时可拨动）
 
 [[islands.items]]
 name = "top"
 command = "top"
 height = 20
-live = true  # true：命令持续输出，自身刷新（适合 top / tail -f）
+live = true  # true：命令持续输出、自身刷新（适合 top / tail -f）
+
+[jump]
+bookmarks = ["/var/log", "/etc/nginx", "/data"]  # 左下「跳转」页：收藏目录（最近访问由运行时记录）
+
+[[commands.items]]  # 左下「命令」页：常用命令，选中后发送到中栏执行
+name = "服务状态"
+command = "systemctl status nginx"
+
+[[commands.items]]
+name = "磁盘"
+command = "df -h"

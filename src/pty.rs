@@ -7,11 +7,11 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 const CURSOR_QUERY: &[u8] = b"\x1b[6n";
-const CURSOR_REPORT: &[u8] = b"\x1b[1;1R";
 
 pub struct PtySession {
     master: Option<Box<dyn MasterPty + Send>>,
     writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+    cursor: Arc<Mutex<(u16, u16)>>,
     child: Box<dyn Child + Send + Sync>,
     reader_thread: Option<JoinHandle<()>>,
     output: Receiver<Vec<u8>>,
@@ -43,6 +43,8 @@ impl PtySession {
         let writer = pair.master.take_writer().context("获取 PTY 写端失败")?;
         let writer = Arc::new(Mutex::new(writer));
         let thread_writer = Arc::clone(&writer);
+        let cursor = Arc::new(Mutex::new((0, 0)));
+        let thread_cursor = Arc::clone(&cursor);
         let (tx, rx) = mpsc::channel();
         let reader_thread = std::thread::Builder::new()
             .name("pty-reader".to_owned())
@@ -53,7 +55,12 @@ impl PtySession {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            respond_to_cursor_queries(&mut carry, &buf[..n], &thread_writer);
+                            respond_to_cursor_queries(
+                                &mut carry,
+                                &buf[..n],
+                                &thread_writer,
+                                &thread_cursor,
+                            );
                             if tx.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
@@ -65,6 +72,7 @@ impl PtySession {
         Ok(Self {
             master: Some(pair.master),
             writer: Some(writer),
+            cursor,
             child,
             reader_thread: Some(reader_thread),
             output: rx,
@@ -102,6 +110,33 @@ impl PtySession {
     pub fn is_finished(&self) -> bool {
         self.finished
     }
+
+    pub fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
+        if let Some(writer) = &self.writer {
+            let mut w = writer.lock().unwrap();
+            w.write_all(bytes).context("写入 PTY 失败")?;
+            w.flush().context("刷新 PTY 失败")?;
+        }
+        Ok(())
+    }
+
+    pub fn set_cursor_position(&self, row: u16, col: u16) {
+        *self.cursor.lock().unwrap() = (row, col);
+    }
+
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        if let Some(master) = &self.master {
+            master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .context("调整 PTY 尺寸失败")?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PtySession {
@@ -120,6 +155,7 @@ fn respond_to_cursor_queries(
     carry: &mut Vec<u8>,
     chunk: &[u8],
     writer: &Mutex<Box<dyn Write + Send>>,
+    cursor: &Mutex<(u16, u16)>,
 ) {
     let mut window = Vec::with_capacity(carry.len() + chunk.len());
     window.extend_from_slice(carry);
@@ -130,8 +166,9 @@ fn respond_to_cursor_queries(
         .windows(CURSOR_QUERY.len())
         .position(|w| w == CURSOR_QUERY)
     {
+        let report = cursor_report(cursor);
         if let Ok(mut w) = writer.lock() {
-            let _ = w.write_all(CURSOR_REPORT);
+            let _ = w.write_all(report.as_bytes());
             let _ = w.flush();
         }
         rest = &rest[pos + CURSOR_QUERY.len()..];
@@ -140,6 +177,11 @@ fn respond_to_cursor_queries(
     let keep = CURSOR_QUERY.len() - 1;
     let start = rest.len().saturating_sub(keep);
     *carry = rest[start..].to_vec();
+}
+
+fn cursor_report(cursor: &Mutex<(u16, u16)>) -> String {
+    let (row, col) = *cursor.lock().unwrap();
+    format!("\x1b[{};{}R", row + 1, col + 1)
 }
 
 #[cfg(test)]
@@ -196,25 +238,38 @@ mod tests {
     fn responds_to_cursor_query_split_across_chunks() {
         let (tx, rx) = mpsc::channel();
         let writer = Mutex::new(Box::new(Sink(tx)) as Box<dyn Write + Send>);
+        let cursor = Mutex::new((0, 0));
         let mut carry = Vec::new();
 
-        respond_to_cursor_queries(&mut carry, b"abc\x1b[", &writer);
+        respond_to_cursor_queries(&mut carry, b"abc\x1b[", &writer, &cursor);
         assert!(rx.try_recv().is_err());
 
-        respond_to_cursor_queries(&mut carry, b"6n tail", &writer);
-        assert_eq!(rx.try_recv().unwrap(), CURSOR_REPORT.to_vec());
+        respond_to_cursor_queries(&mut carry, b"6n tail", &writer, &cursor);
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[1;1R".to_vec());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn responds_with_current_cursor_position() {
+        let (tx, rx) = mpsc::channel();
+        let writer = Mutex::new(Box::new(Sink(tx)) as Box<dyn Write + Send>);
+        let cursor = Mutex::new((5, 7));
+        let mut carry = Vec::new();
+
+        respond_to_cursor_queries(&mut carry, b"\x1b[6n", &writer, &cursor);
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[6;8R".to_vec());
     }
 
     #[test]
     fn responds_to_each_cursor_query_in_chunk() {
         let (tx, rx) = mpsc::channel();
         let writer = Mutex::new(Box::new(Sink(tx)) as Box<dyn Write + Send>);
+        let cursor = Mutex::new((2, 3));
         let mut carry = Vec::new();
 
-        respond_to_cursor_queries(&mut carry, b"\x1b[6nX\x1b[6n", &writer);
-        assert_eq!(rx.try_recv().unwrap(), CURSOR_REPORT.to_vec());
-        assert_eq!(rx.try_recv().unwrap(), CURSOR_REPORT.to_vec());
+        respond_to_cursor_queries(&mut carry, b"\x1b[6nX\x1b[6n", &writer, &cursor);
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[3;4R".to_vec());
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[3;4R".to_vec());
         assert!(rx.try_recv().is_err());
     }
 

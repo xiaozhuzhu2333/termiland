@@ -5,7 +5,17 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::app::{App, LeftPage};
-use crate::config::{CommandsConfig, Island, JumpConfig};
+use crate::config::{CommandsConfig, Island, JumpConfig, UiConfig};
+
+pub fn terminal_pane_inner(area: Rect, config: &UiConfig) -> Rect {
+    let [_, center, _] = Layout::horizontal([
+        Constraint::Length(config.left_width),
+        Constraint::Min(10),
+        Constraint::Length(config.right_width),
+    ])
+    .areas(area);
+    Block::bordered().inner(center)
+}
 
 pub fn draw(f: &mut Frame, app: &App) {
     let [left, center, right] = Layout::horizontal([
@@ -31,21 +41,35 @@ fn placeholder(f: &mut Frame, area: Rect, title: &str, text: &str) {
 }
 
 fn terminal_pane(f: &mut Frame, area: Rect, app: &App) {
-    let status = if app.pty.is_alive() {
-        format_bytes(app.pty_bytes())
-    } else if app.pty.is_finished() {
+    let status = if let Some(text) = app.copy_notice_text() {
+        text
+    } else if let Some(count) = app.selection_chars() {
+        format!("选中 {count} 字符")
+    } else if app.scroll() > 0 {
+        format!("↑ {} 行", app.scroll())
+    } else if !app.pty.is_alive() && app.pty.is_finished() {
         "已退出".to_owned()
-    } else {
+    } else if !app.pty.is_alive() {
         "已退出 · 排空中".to_owned()
+    } else {
+        String::new()
     };
     let block = Block::bordered()
         .title("终端")
-        .title_top(Line::from(status).right_aligned());
+        .title_top(Line::from(status).right_aligned())
+        .title_bottom(
+            Line::from(Span::styled(
+                "Ctrl+Q 退出 · F1 切页",
+                Style::new().fg(Color::DarkGray),
+            ))
+            .right_aligned(),
+        );
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let screen = app.term.screen();
     let (rows, cols) = screen.size();
+    let selection = app.selection();
     for row in 0..rows.min(inner.height) {
         for col in 0..cols.min(inner.width) {
             let Some(cell) = screen.cell(row, col) else {
@@ -62,13 +86,18 @@ fn terminal_pane(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 cell.contents()
             };
+            let style = if selection.is_some_and(|s| s.contains(row, col)) {
+                cell_style(cell).add_modifier(Modifier::REVERSED)
+            } else {
+                cell_style(cell)
+            };
             f.buffer_mut()[(inner.x + col, inner.y + row)]
                 .set_symbol(symbol)
-                .set_style(cell_style(cell));
+                .set_style(style);
         }
     }
 
-    if app.pty.is_alive() {
+    if app.pty.is_alive() && app.scroll() == 0 {
         let (cursor_row, cursor_col) = screen.cursor_position();
         if cursor_row < inner.height && cursor_col < inner.width {
             f.set_cursor_position((inner.x + cursor_col, inner.y + cursor_row));
@@ -104,16 +133,6 @@ fn map_color(color: vt100::Color) -> Color {
         vt100::Color::Default => Color::Reset,
         vt100::Color::Idx(i) => Color::Indexed(i),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1} MiB", bytes as f64 / 1024.0 / 1024.0)
     }
 }
 
@@ -230,11 +249,15 @@ mod tests {
     }
 
     #[test]
-    fn formats_byte_counts() {
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(2048), "2.0 KiB");
-        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MiB");
+    fn computes_terminal_pane_inner() {
+        let cfg = UiConfig {
+            left_width: 22,
+            right_width: 36,
+        };
+        let inner = terminal_pane_inner(Rect::new(0, 0, 120, 30), &cfg);
+        assert_eq!((inner.height, inner.width), (28, 60));
+        let inner = terminal_pane_inner(Rect::new(0, 0, 80, 24), &cfg);
+        assert_eq!((inner.height, inner.width), (22, 20));
     }
 
     #[test]

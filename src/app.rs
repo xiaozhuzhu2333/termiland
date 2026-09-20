@@ -251,9 +251,14 @@ impl App {
 
     fn scroll_by(&mut self, delta: i32) {
         let screen = self.term.screen_mut();
-        let target = (screen.scrollback() as i32 + delta).max(0) as usize;
+        let before = screen.scrollback();
+        let target = (before as i32 + delta).max(0) as usize;
         screen.set_scrollback(target);
-        self.scroll = screen.scrollback() as u16;
+        let after = screen.scrollback();
+        self.scroll = after as u16;
+        if after != before {
+            self.selection = None;
+        }
     }
 
     fn reset_scroll(&mut self) {
@@ -350,5 +355,25 @@ mod tests {
         assert!(app.scroll() > 100, "scrollback clamp failed");
         app.reset_scroll();
         assert_eq!(app.scroll(), 0);
+    }
+
+    #[test]
+    fn scrolling_clears_selection() {
+        let mut app = App::new(Config::default()).expect("app");
+        for i in 0..100 {
+            app.term.process(format!("line{i}\r\n").as_bytes());
+        }
+
+        app.selection = Some(Selection {
+            start: (0, 0),
+            end: (0, 5),
+        });
+        app.scroll_by(-3);
+        assert_eq!(app.scroll(), 0);
+        assert!(app.selection.is_some(), "视图未移动时选区应保留");
+
+        app.scroll_by(3);
+        assert_eq!(app.scroll(), 3);
+        assert!(app.selection.is_none(), "视图移动后选区应清除");
     }
 }

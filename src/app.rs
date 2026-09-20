@@ -27,6 +27,7 @@ pub struct App {
     pub config: Config,
     pub left_page: LeftPage,
     pub pty: pty::PtySession,
+    pub term: vt100::Parser,
     pty_bytes: u64,
     should_quit: bool,
 }
@@ -38,6 +39,7 @@ impl App {
             config,
             left_page: LeftPage::Jump,
             pty,
+            term: vt100::Parser::new(24, 80, 0),
             pty_bytes: 0,
             should_quit: false,
         })
@@ -46,7 +48,10 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
             let output = self.pty.poll_output();
-            self.pty_bytes += output.len() as u64;
+            if !output.is_empty() {
+                self.pty_bytes += output.len() as u64;
+                self.term.process(&output);
+            }
             terminal.draw(|f| ui::draw(f, self))?;
             self.handle_events()?;
         }

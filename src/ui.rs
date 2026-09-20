@@ -31,20 +31,90 @@ fn placeholder(f: &mut Frame, area: Rect, title: &str, text: &str) {
 }
 
 fn terminal_pane(f: &mut Frame, area: Rect, app: &App) {
-    let text = if app.pty.is_alive() {
-        format!("PTY 已连接 · 已接收 {} 字节", app.pty_bytes())
+    let status = if app.pty.is_alive() {
+        format_bytes(app.pty_bytes())
     } else if app.pty.is_finished() {
-        "Shell 已退出".to_owned()
+        "已退出".to_owned()
     } else {
-        "Shell 已退出 · 输出排空中".to_owned()
+        "已退出 · 排空中".to_owned()
     };
-    let block = Block::bordered().title("终端");
-    f.render_widget(
-        Paragraph::new(text)
-            .alignment(Alignment::Center)
-            .block(block),
-        area,
-    );
+    let block = Block::bordered()
+        .title("终端")
+        .title_top(Line::from(status).right_aligned());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let screen = app.term.screen();
+    let (rows, cols) = screen.size();
+    for row in 0..rows.min(inner.height) {
+        for col in 0..cols.min(inner.width) {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            if cell.is_wide() && col + 1 >= inner.width {
+                continue;
+            }
+            let symbol = if cell.contents().is_empty() {
+                " "
+            } else {
+                cell.contents()
+            };
+            f.buffer_mut()[(inner.x + col, inner.y + row)]
+                .set_symbol(symbol)
+                .set_style(cell_style(cell));
+        }
+    }
+
+    if app.pty.is_alive() {
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        if cursor_row < inner.height && cursor_col < inner.width {
+            f.set_cursor_position((inner.x + cursor_col, inner.y + cursor_row));
+        }
+    }
+}
+
+fn cell_style(cell: &vt100::Cell) -> Style {
+    let mut style = Style::new()
+        .fg(map_color(cell.fgcolor()))
+        .bg(map_color(cell.bgcolor()));
+    let mut modifier = Modifier::empty();
+    if cell.bold() {
+        modifier |= Modifier::BOLD;
+    }
+    if cell.italic() {
+        modifier |= Modifier::ITALIC;
+    }
+    if cell.underline() {
+        modifier |= Modifier::UNDERLINED;
+    }
+    if cell.inverse() {
+        modifier |= Modifier::REVERSED;
+    }
+    if !modifier.is_empty() {
+        style = style.add_modifier(modifier);
+    }
+    style
+}
+
+fn map_color(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(i) => Color::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / 1024.0 / 1024.0)
+    }
 }
 
 fn left_column(f: &mut Frame, area: Rect, app: &App) {
@@ -143,4 +213,94 @@ fn render_island(f: &mut Frame, area: Rect, island: &Island) {
         Style::new().fg(Color::DarkGray),
     ));
     f.render_widget(body.block(block), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_vt100_colors_to_ratatui() {
+        assert_eq!(map_color(vt100::Color::Default), Color::Reset);
+        assert_eq!(map_color(vt100::Color::Idx(4)), Color::Indexed(4));
+        assert_eq!(
+            map_color(vt100::Color::Rgb(10, 20, 30)),
+            Color::Rgb(10, 20, 30)
+        );
+    }
+
+    #[test]
+    fn formats_byte_counts() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.0 KiB");
+        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MiB");
+    }
+
+    #[test]
+    fn full_draw_keeps_cells_complete() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        use crate::app::App;
+        use crate::config::{CommandsConfig, Config, Island, IslandsConfig, JumpConfig, UiConfig};
+
+        let config = Config {
+            ui: UiConfig {
+                left_width: 22,
+                right_width: 36,
+            },
+            islands: IslandsConfig {
+                max: 3,
+                items: vec![
+                    Island {
+                        name: Some("history".to_owned()),
+                        command: "tail -n 30 $HISTFILE".to_owned(),
+                        height: Some(12),
+                        live: false,
+                    },
+                    Island {
+                        name: Some("top".to_owned()),
+                        command: "top".to_owned(),
+                        height: Some(20),
+                        live: true,
+                    },
+                ],
+            },
+            jump: JumpConfig::default(),
+            commands: CommandsConfig::default(),
+        };
+
+        let mut app = App::new(config).expect("app");
+        let mut total = 0u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let out = app.pty.poll_output();
+            total += out.len() as u64;
+            app.term.process(&out);
+            if total > 100 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut empties = Vec::new();
+        for y in 0..30u16 {
+            for x in 0..120u16 {
+                if buf[(x, y)].symbol().is_empty() {
+                    empties.push((x, y));
+                }
+            }
+        }
+        assert!(empties.is_empty(), "存在空 symbol 格子: {empties:?}");
+
+        for y in [1u16, 5, 10, 13, 20, 28] {
+            let border = buf[(84, y)].symbol();
+            assert_eq!(border, "│", "y={y} 处岛栏左边框被破坏: {border:?}");
+        }
+    }
 }

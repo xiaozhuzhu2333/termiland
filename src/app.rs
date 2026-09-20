@@ -189,6 +189,12 @@ impl App {
             self.copy_selection();
         } else if is_press && key.code == KeyCode::F(1) {
             self.left_page = self.left_page.next();
+        } else if is_press
+            && key.code == KeyCode::End
+            && key.modifiers.is_empty()
+            && self.scroll > 0
+        {
+            self.reset_scroll();
         } else if let Some(bytes) = keys::encode(&key) {
             input.extend_from_slice(&bytes);
         }
@@ -199,12 +205,16 @@ impl App {
             MouseEventKind::ScrollUp => self.scroll_by(SCROLL_STEP),
             MouseEventKind::ScrollDown => self.scroll_by(-SCROLL_STEP),
             MouseEventKind::Down(MouseButton::Left) => {
-                self.selection = self
-                    .term_cell_at(mouse.column, mouse.row)
-                    .map(|pos| Selection {
-                        start: pos,
-                        end: pos,
-                    });
+                if self.jump_button_hit(mouse.column, mouse.row) {
+                    self.reset_scroll();
+                } else {
+                    self.selection =
+                        self.term_cell_at(mouse.column, mouse.row)
+                            .map(|pos| Selection {
+                                start: pos,
+                                end: pos,
+                            });
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(pos) = self.term_cell_at(mouse.column, mouse.row)
@@ -222,6 +232,16 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn jump_button_hit(&self, column: u16, row: u16) -> bool {
+        if self.scroll == 0 {
+            return false;
+        }
+        let pane = self.pane_inner;
+        let corner = pane.x + pane.width;
+        let border_row = pane.y.saturating_sub(1);
+        row == border_row && column + 8 >= corner && column <= corner
     }
 
     fn copy_selection(&mut self) {
@@ -262,6 +282,9 @@ impl App {
     }
 
     fn reset_scroll(&mut self) {
+        if self.scroll > 0 {
+            self.selection = None;
+        }
         self.term.screen_mut().set_scrollback(0);
         self.scroll = 0;
     }
@@ -357,6 +380,69 @@ mod tests {
         assert_eq!(app.scroll(), 0);
     }
 
+    fn press_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn end_key_jumps_to_bottom_when_scrolled() {
+        let mut app = App::new(Config::default()).expect("app");
+        for i in 0..100 {
+            app.term.process(format!("line{i}\r\n").as_bytes());
+        }
+        app.scroll_by(10);
+        assert_eq!(app.scroll(), 10);
+
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::End, KeyModifiers::NONE), &mut input);
+        assert_eq!(app.scroll(), 0);
+        assert!(input.is_empty(), "回看时 End 不应发给 shell");
+    }
+
+    #[test]
+    fn end_key_goes_to_shell_when_live() {
+        let mut app = App::new(Config::default()).expect("app");
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::End, KeyModifiers::NONE), &mut input);
+        assert_eq!(app.scroll(), 0);
+        assert_eq!(input, b"\x1b[F".to_vec());
+    }
+
+    #[test]
+    fn jump_button_click_returns_to_bottom() {
+        let mut app = App::new(Config::default()).expect("app");
+        for i in 0..100 {
+            app.term.process(format!("line{i}\r\n").as_bytes());
+        }
+        app.scroll_by(10);
+        assert_eq!(app.scroll(), 10);
+
+        app.pane_inner = Rect::new(10, 1, 40, 20);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 48,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(click);
+        assert_eq!(app.scroll(), 0);
+
+        let no_hit = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 30,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.scroll_by(10);
+        app.handle_mouse(no_hit);
+        assert_eq!(app.scroll(), 10, "按钮区域外不应触发回底");
+    }
+
     #[test]
     fn scrolling_clears_selection() {
         let mut app = App::new(Config::default()).expect("app");
@@ -375,5 +461,43 @@ mod tests {
         app.scroll_by(3);
         assert_eq!(app.scroll(), 3);
         assert!(app.selection.is_none(), "视图移动后选区应清除");
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_render_vs_history() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        use crate::ui;
+
+        for history in [0usize, 500, 2000, 5000] {
+            let mut app = App::new(Config::default()).expect("app");
+            app.term.screen_mut().set_size(28, 60);
+            for i in 0..history {
+                app.term.process(format!("line {i}\r\n").as_bytes());
+            }
+            let depth = {
+                let screen = app.term.screen_mut();
+                screen.set_scrollback(usize::MAX);
+                let d = screen.scrollback();
+                screen.set_scrollback(0);
+                d
+            };
+            let cell_start = std::time::Instant::now();
+            for _ in 0..1000 {
+                let _ = app.term.screen().cell(0, 0);
+            }
+            let cell_us = cell_start.elapsed().as_micros() as f64 / 1000.0;
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..50 {
+                terminal.draw(|f| ui::draw(f, &app)).unwrap();
+            }
+            let per_frame = start.elapsed() / 50;
+            println!(
+                "history={history:5}  depth={depth:5}  cell(0,0)={cell_us:.3}ms  {per_frame:?}/帧"
+            );
+        }
     }
 }

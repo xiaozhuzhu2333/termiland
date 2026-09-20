@@ -42,21 +42,31 @@ fn placeholder(f: &mut Frame, area: Rect, title: &str, text: &str) {
 
 fn terminal_pane(f: &mut Frame, area: Rect, app: &App) {
     let status = if let Some(text) = app.copy_notice_text() {
-        text
+        Line::from(text)
     } else if let Some(count) = app.selection_chars() {
-        format!("选中 {count} 字符")
+        Line::from(format!("选中 {count} 字符"))
     } else if app.scroll() > 0 {
-        format!("↑ {} 行", app.scroll())
+        Line::from(vec![
+            Span::styled(
+                format!("↑ {} 行", app.scroll()),
+                Style::new().fg(Color::DarkGray),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "↓ 底部",
+                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+        ])
     } else if !app.pty.is_alive() && app.pty.is_finished() {
-        "已退出".to_owned()
+        Line::from("已退出")
     } else if !app.pty.is_alive() {
-        "已退出 · 排空中".to_owned()
+        Line::from("已退出 · 排空中")
     } else {
-        String::new()
+        Line::from("")
     };
     let block = Block::bordered()
         .title("终端")
-        .title_top(Line::from(status).right_aligned())
+        .title_top(status.right_aligned())
         .title_bottom(
             Line::from(Span::styled(
                 "Ctrl+Q 退出 · F1 切页",

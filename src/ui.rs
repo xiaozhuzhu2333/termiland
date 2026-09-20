@@ -15,13 +15,30 @@ pub fn draw(f: &mut Frame, app: &App) {
     ])
     .areas(f.area());
 
-    placeholder(f, center, "终端", "M1 · PTY Shell");
+    terminal_pane(f, center, app);
     left_column(f, left, app);
     islands_column(f, right, app);
 }
 
 fn placeholder(f: &mut Frame, area: Rect, title: &str, text: &str) {
     let block = Block::bordered().title(title);
+    f.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .block(block),
+        area,
+    );
+}
+
+fn terminal_pane(f: &mut Frame, area: Rect, app: &App) {
+    let text = if app.pty.is_alive() {
+        format!("PTY 已连接 · 已接收 {} 字节", app.pty_bytes())
+    } else if app.pty.is_finished() {
+        "Shell 已退出".to_owned()
+    } else {
+        "Shell 已退出 · 输出排空中".to_owned()
+    };
+    let block = Block::bordered().title("终端");
     f.render_widget(
         Paragraph::new(text)
             .alignment(Alignment::Center)

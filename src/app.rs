@@ -5,6 +5,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 
 use crate::config::Config;
+use crate::pty;
 use crate::ui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,24 +26,35 @@ impl LeftPage {
 pub struct App {
     pub config: Config,
     pub left_page: LeftPage,
+    pub pty: pty::PtySession,
+    pty_bytes: u64,
     should_quit: bool,
 }
 
 impl App {
-    pub fn new(config: Config) -> Self {
-        Self {
+    pub fn new(config: Config) -> Result<Self> {
+        let pty = pty::PtySession::spawn(24, 80)?;
+        Ok(Self {
             config,
             left_page: LeftPage::Jump,
+            pty,
+            pty_bytes: 0,
             should_quit: false,
-        }
+        })
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
+            let output = self.pty.poll_output();
+            self.pty_bytes += output.len() as u64;
             terminal.draw(|f| ui::draw(f, self))?;
             self.handle_events()?;
         }
         Ok(())
+    }
+
+    pub fn pty_bytes(&self) -> u64 {
+        self.pty_bytes
     }
 
     fn handle_events(&mut self) -> Result<()> {

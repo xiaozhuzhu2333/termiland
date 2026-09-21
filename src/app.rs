@@ -29,6 +29,12 @@ pub enum Focus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IslandHit {
+    Body,
+    Toggle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     start: (u16, u16),
     end: (u16, u16),
@@ -80,6 +86,9 @@ pub struct App {
     pub islands: Vec<Island>,
     pty_size: (u16, u16),
     pane_inner: Rect,
+    layout_area: Rect,
+    island_areas: Vec<Rect>,
+    paged_panel: Rect,
     scroll: u16,
     selection: Option<Selection>,
     copy_notice: Option<(usize, Instant)>,
@@ -94,6 +103,8 @@ impl App {
         let pane_inner = ui::terminal_pane_inner(area, &config.ui);
         let (rows, cols) = (pane_inner.height.max(1), pane_inner.width.max(1));
         let islands = config.islands.items.clone();
+        let island_areas = ui::island_layout(ui::right_pane_rect(area, &config.ui), &islands);
+        let paged_panel = ui::paged_panel_rect(area, &config.ui);
         let pty = pty::PtySession::spawn(rows, cols)?;
         let term = vt100::Parser::new(rows, cols, SCROLLBACK_LEN);
         Ok(Self {
@@ -104,6 +115,9 @@ impl App {
             islands,
             pty_size: (rows, cols),
             pane_inner,
+            layout_area: area,
+            island_areas,
+            paged_panel,
             scroll: 0,
             selection: None,
             copy_notice: None,
@@ -114,7 +128,7 @@ impl App {
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
-            self.sync_pane_size(terminal)?;
+            self.sync_layout(terminal)?;
             let output = self.pty.poll_output();
             if !output.is_empty() {
                 self.term.process(&output);
@@ -127,9 +141,16 @@ impl App {
         Ok(())
     }
 
-    fn sync_pane_size(&mut self, terminal: &DefaultTerminal) -> Result<()> {
+    fn sync_layout(&mut self, terminal: &DefaultTerminal) -> Result<()> {
         let area: Rect = terminal.size()?.into();
+        if area == self.layout_area {
+            return Ok(());
+        }
+        self.layout_area = area;
         self.pane_inner = ui::terminal_pane_inner(area, &self.config.ui);
+        self.island_areas =
+            ui::island_layout(ui::right_pane_rect(area, &self.config.ui), &self.islands);
+        self.paged_panel = ui::paged_panel_rect(area, &self.config.ui);
         let size = (self.pane_inner.height.max(1), self.pane_inner.width.max(1));
         if self.pty_size != size {
             self.pty_size = size;
@@ -249,15 +270,26 @@ impl App {
             MouseEventKind::ScrollUp => self.scroll_by(SCROLL_STEP),
             MouseEventKind::ScrollDown => self.scroll_by(-SCROLL_STEP),
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.jump_button_hit(mouse.column, mouse.row) {
+                if let Some((index, hit)) = self.island_hit(mouse.column, mouse.row) {
+                    self.selection = None;
+                    self.focus = Focus::Island(index);
+                    if hit == IslandHit::Toggle {
+                        self.toggle_island_live(index);
+                    }
+                } else if self.jump_button_hit(mouse.column, mouse.row) {
                     self.reset_scroll();
+                } else if let Some(page) =
+                    ui::paged_tab_hit(self.paged_panel, mouse.column, mouse.row)
+                {
+                    self.left_page = page;
+                } else if let Some(pos) = self.term_cell_at(mouse.column, mouse.row) {
+                    self.focus = Focus::Terminal;
+                    self.selection = Some(Selection {
+                        start: pos,
+                        end: pos,
+                    });
                 } else {
-                    self.selection =
-                        self.term_cell_at(mouse.column, mouse.row)
-                            .map(|pos| Selection {
-                                start: pos,
-                                end: pos,
-                            });
+                    self.selection = None;
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -275,6 +307,30 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn island_hit(&self, column: u16, row: u16) -> Option<(usize, IslandHit)> {
+        for (index, area) in self.island_areas.iter().enumerate() {
+            if column >= area.x
+                && column < area.x + area.width
+                && row >= area.y
+                && row < area.y + area.height
+            {
+                let hit = if row == area.y && column + 10 >= area.x + area.width {
+                    IslandHit::Toggle
+                } else {
+                    IslandHit::Body
+                };
+                return Some((index, hit));
+            }
+        }
+        None
+    }
+
+    fn toggle_island_live(&mut self, index: usize) {
+        if let Some(island) = self.islands.get_mut(index) {
+            island.live = !island.live;
         }
     }
 
@@ -486,6 +542,56 @@ mod tests {
         app.handle_key(press_key(KeyCode::Tab, KeyModifiers::NONE), &mut input);
         assert_eq!(app.focus(), Focus::Terminal);
         assert_eq!(input, b"\t".to_vec());
+    }
+
+    #[test]
+    fn clicking_island_focuses_and_toggles() {
+        let mut app = app_with_islands();
+        app.island_areas = vec![Rect::new(50, 0, 36, 12), Rect::new(50, 12, 36, 12)];
+
+        let body_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 60,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(body_click);
+        assert_eq!(app.focus(), Focus::Island(0));
+        assert!(!app.islands[0].live, "点击岛体不应拨动开关");
+
+        let toggle_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 84,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(toggle_click);
+        assert_eq!(app.focus(), Focus::Island(0));
+        assert!(app.islands[0].live);
+        assert!(!app.islands[1].live, "只拨动被点击的岛");
+
+        app.handle_mouse(toggle_click);
+        assert!(!app.islands[0].live, "再次点击应拨回");
+    }
+
+    #[test]
+    fn clicking_terminal_returns_focus() {
+        let mut app = app_with_islands();
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Island(0));
+
+        app.island_areas = Vec::new();
+        app.pane_inner = Rect::new(10, 1, 40, 20);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 30,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(click);
+        assert_eq!(app.focus(), Focus::Terminal);
+        assert!(app.selection.is_some());
     }
 
     #[test]

@@ -15,6 +15,67 @@ fn focus_border(focused: bool) -> Style {
     }
 }
 
+const TAB_LABELS: [&str; 2] = ["跳转", "命令"];
+
+fn display_width(s: &str) -> u16 {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+pub fn paged_tab_hit(panel: Rect, column: u16, row: u16) -> Option<LeftPage> {
+    if row != panel.y || column <= panel.x || column >= panel.x + panel.width {
+        return None;
+    }
+    let mut x = panel.x + 1;
+    for (index, label) in TAB_LABELS.iter().enumerate() {
+        let width = display_width(label) + 2;
+        if column >= x && column < x + width {
+            return Some(if index == 0 {
+                LeftPage::Jump
+            } else {
+                LeftPage::Commands
+            });
+        }
+        x += width + 1;
+    }
+    None
+}
+
+pub fn right_pane_rect(area: Rect, config: &UiConfig) -> Rect {
+    let [_, _, right] = Layout::horizontal([
+        Constraint::Length(config.left_width),
+        Constraint::Min(10),
+        Constraint::Length(config.right_width),
+    ])
+    .areas(area);
+    right
+}
+
+pub fn paged_panel_rect(area: Rect, config: &UiConfig) -> Rect {
+    let [left, _, _] = Layout::horizontal([
+        Constraint::Length(config.left_width),
+        Constraint::Min(10),
+        Constraint::Length(config.right_width),
+    ])
+    .areas(area);
+    let [_, panel] =
+        Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(left);
+    panel
+}
+
+pub fn island_layout(area: Rect, islands: &[Island]) -> Vec<Rect> {
+    if islands.is_empty() {
+        return Vec::new();
+    }
+    let constraints: Vec<Constraint> = islands
+        .iter()
+        .map(|i| match i.height {
+            Some(h) => Constraint::Length(h.max(3)),
+            None => Constraint::Fill(1),
+        })
+        .collect();
+    Layout::vertical(constraints).split(area).to_vec()
+}
+
 pub fn terminal_pane_inner(area: Rect, config: &UiConfig) -> Rect {
     let [_, center, _] = Layout::horizontal([
         Constraint::Length(config.left_width),
@@ -210,9 +271,9 @@ fn page_tabs(page: LeftPage) -> Line<'static> {
         Span::styled(format!("[{label}]"), style)
     };
     Line::from(vec![
-        tab("跳转", page == LeftPage::Jump),
+        tab(TAB_LABELS[0], page == LeftPage::Jump),
         Span::raw(" "),
-        tab("命令", page == LeftPage::Commands),
+        tab(TAB_LABELS[1], page == LeftPage::Commands),
     ])
 }
 
@@ -227,15 +288,7 @@ fn islands_column(f: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    let constraints: Vec<Constraint> = app
-        .islands
-        .iter()
-        .map(|i| match i.height {
-            Some(h) => Constraint::Length(h.max(3)),
-            None => Constraint::Fill(1),
-        })
-        .collect();
-    let areas = Layout::vertical(constraints).split(area);
+    let areas = island_layout(area, &app.islands);
     for (index, (island, &island_area)) in app.islands.iter().zip(areas.iter()).enumerate() {
         render_island(f, island_area, island, app.focus() == Focus::Island(index));
     }
@@ -265,6 +318,17 @@ fn render_island(f: &mut Frame, area: Rect, island: &Island, focused: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paged_tab_hit_matches_label_regions() {
+        let panel = Rect::new(0, 5, 22, 10);
+        assert_eq!(paged_tab_hit(panel, 2, 5), Some(LeftPage::Jump));
+        assert_eq!(paged_tab_hit(panel, 6, 5), Some(LeftPage::Jump));
+        assert_eq!(paged_tab_hit(panel, 9, 5), Some(LeftPage::Commands));
+        assert_eq!(paged_tab_hit(panel, 13, 5), Some(LeftPage::Commands));
+        assert_eq!(paged_tab_hit(panel, 18, 5), None);
+        assert_eq!(paged_tab_hit(panel, 2, 6), None);
+    }
 
     #[test]
     fn maps_vt100_colors_to_ratatui() {

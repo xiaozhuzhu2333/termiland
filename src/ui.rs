@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::app::{App, Focus, LeftPage, Selection};
+use crate::app::{App, Focus, LeftPage, NoticeKind, Selection};
 use crate::config::{CommandsConfig, JumpConfig, UiConfig};
 use crate::island::IslandState;
 
@@ -41,23 +41,31 @@ pub fn paged_tab_hit(panel: Rect, column: u16, row: u16) -> Option<LeftPage> {
     None
 }
 
-pub fn right_pane_rect(area: Rect, config: &UiConfig) -> Rect {
-    let [_, _, right] = Layout::horizontal([
-        Constraint::Length(config.left_width),
-        Constraint::Min(10),
-        Constraint::Length(config.right_width),
-    ])
-    .areas(area);
-    right
+pub const EMPTY_RIGHT_WIDTH: u16 = 8;
+
+pub fn right_pane_width(config: &UiConfig, islands_empty: bool) -> u16 {
+    if islands_empty {
+        EMPTY_RIGHT_WIDTH
+    } else {
+        config.right_width
+    }
 }
 
-pub fn paged_panel_rect(area: Rect, config: &UiConfig) -> Rect {
-    let [left, _, _] = Layout::horizontal([
-        Constraint::Length(config.left_width),
+fn pane_areas(area: Rect, left_width: u16, right_width: u16) -> [Rect; 3] {
+    Layout::horizontal([
+        Constraint::Length(left_width),
         Constraint::Min(10),
-        Constraint::Length(config.right_width),
+        Constraint::Length(right_width),
     ])
-    .areas(area);
+    .areas(area)
+}
+
+pub fn right_pane_rect(area: Rect, left_width: u16, right_width: u16) -> Rect {
+    pane_areas(area, left_width, right_width)[2]
+}
+
+pub fn paged_panel_rect(area: Rect, left_width: u16, right_width: u16) -> Rect {
+    let [left, _, _] = pane_areas(area, left_width, right_width);
     let [_, panel] =
         Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(left);
     panel
@@ -77,6 +85,25 @@ pub fn island_layout(area: Rect, heights: &[Option<u16>]) -> Vec<Rect> {
     Layout::vertical(constraints).split(area).to_vec()
 }
 
+pub fn islands_body_and_bar(right: Rect) -> (Rect, Rect) {
+    let bar = Rect {
+        x: right.x,
+        y: right.y + right.height.saturating_sub(1),
+        width: right.width,
+        height: 1,
+    };
+    let body = Rect {
+        height: right.height.saturating_sub(1),
+        ..right
+    };
+    (body, bar)
+}
+
+pub fn add_button_zone(bar: Rect) -> (u16, u16) {
+    let x = bar.x + bar.width / 2 - display_width("[+]") / 2;
+    (x, 3)
+}
+
 pub fn island_inner(rect: Rect) -> Rect {
     Rect {
         x: rect.x.saturating_add(1),
@@ -94,23 +121,14 @@ pub fn island_output_inner(rect: Rect) -> Rect {
     }
 }
 
-pub fn terminal_pane_inner(area: Rect, config: &UiConfig) -> Rect {
-    let [_, center, _] = Layout::horizontal([
-        Constraint::Length(config.left_width),
-        Constraint::Min(10),
-        Constraint::Length(config.right_width),
-    ])
-    .areas(area);
+pub fn terminal_pane_inner(area: Rect, left_width: u16, right_width: u16) -> Rect {
+    let center = pane_areas(area, left_width, right_width)[1];
     Block::bordered().inner(center)
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
-    let [left, center, right] = Layout::horizontal([
-        Constraint::Length(app.config.ui.left_width),
-        Constraint::Min(10),
-        Constraint::Length(app.config.ui.right_width),
-    ])
-    .areas(f.area());
+    let right_width = right_pane_width(&app.config.ui, app.islands.is_empty());
+    let [left, center, right] = pane_areas(f.area(), app.config.ui.left_width, right_width);
 
     terminal_pane(f, center, app);
     left_column(f, left, app);
@@ -119,17 +137,26 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn placeholder(f: &mut Frame, area: Rect, title: &str, text: &str, border: Style) {
     let block = Block::bordered().border_style(border).title(title);
-    f.render_widget(
-        Paragraph::new(text)
-            .alignment(Alignment::Center)
-            .block(block),
-        area,
-    );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let centered = Rect {
+        y: inner.y + inner.height / 2,
+        height: 1,
+        ..inner
+    };
+    f.render_widget(Paragraph::new(text).alignment(Alignment::Center), centered);
 }
 
 fn terminal_pane(f: &mut Frame, area: Rect, app: &App) {
-    let status = if let Some(text) = app.copy_notice_text() {
-        Line::from(text)
+    let status = if let Some((text, kind)) = app.notice_text() {
+        let style = match kind {
+            NoticeKind::Warn => Style::new().fg(Color::Red),
+            NoticeKind::Info => Style::new(),
+        };
+        Line::from(Span::styled(text, style))
     } else if let Some(count) = app.selection_chars() {
         Line::from(format!("选中 {count} 字符"))
     } else if app.scroll() > 0 {
@@ -298,15 +325,21 @@ fn page_tabs(page: LeftPage) -> Line<'static> {
 }
 
 fn islands_column(f: &mut Frame, area: Rect, app: &App) {
+    let (body, bar) = islands_body_and_bar(area);
     if app.islands.is_empty() {
-        placeholder(f, area, "岛", "无岛", focus_border(false));
-        return;
+        placeholder(f, body, "岛", "无岛", focus_border(false));
+    } else {
+        let heights: Vec<Option<u16>> = app.islands.iter().map(|i| i.height).collect();
+        let areas = island_layout(body, &heights);
+        for (index, (island, &island_area)) in app.islands.iter().zip(areas.iter()).enumerate() {
+            render_island(f, island_area, island, app.focus() == Focus::Island(index));
+        }
     }
-    let heights: Vec<Option<u16>> = app.islands.iter().map(|i| i.height).collect();
-    let areas = island_layout(area, &heights);
-    for (index, (island, &island_area)) in app.islands.iter().zip(areas.iter()).enumerate() {
-        render_island(f, island_area, island, app.focus() == Focus::Island(index));
-    }
+    let bar_line = Line::from(Span::styled(
+        "[+]",
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ));
+    f.render_widget(Paragraph::new(bar_line).alignment(Alignment::Center), bar);
 }
 
 fn render_island(f: &mut Frame, area: Rect, island: &IslandState, focused: bool) {
@@ -328,6 +361,8 @@ fn render_island(f: &mut Frame, area: Rect, island: &IslandState, focused: bool)
         ));
     }
     badge_spans.push(Span::styled(badge, Style::new().fg(badge_color)));
+    badge_spans.push(Span::raw(" "));
+    badge_spans.push(Span::styled("×", Style::new().fg(Color::Red)));
     let mut block = Block::bordered()
         .border_style(focus_border(focused))
         .title(title)
@@ -335,7 +370,7 @@ fn render_island(f: &mut Frame, area: Rect, island: &IslandState, focused: bool)
     if focused {
         block = block.title_bottom(
             Line::from(Span::styled(
-                "↑↓ 切换 · 回车执行 · Esc 返回",
+                "↑↓ 切换 · 回车执行",
                 Style::new().fg(Color::DarkGray),
             ))
             .right_aligned(),
@@ -410,9 +445,9 @@ mod tests {
             left_width: 22,
             right_width: 36,
         };
-        let inner = terminal_pane_inner(Rect::new(0, 0, 120, 30), &cfg);
+        let inner = terminal_pane_inner(Rect::new(0, 0, 120, 30), cfg.left_width, cfg.right_width);
         assert_eq!((inner.height, inner.width), (28, 60));
-        let inner = terminal_pane_inner(Rect::new(0, 0, 80, 24), &cfg);
+        let inner = terminal_pane_inner(Rect::new(0, 0, 80, 24), cfg.left_width, cfg.right_width);
         assert_eq!((inner.height, inner.width), (22, 20));
     }
 
@@ -461,9 +496,14 @@ mod tests {
         }
         assert!(empties.is_empty(), "存在空 symbol 格子: {empties:?}");
 
-        for y in [1u16, 5, 10, 13, 20, 28] {
+        for y in [1u16, 5, 10, 13, 20, 27] {
             let border = buf[(84, y)].symbol();
             assert_eq!(border, "│", "y={y} 处岛栏左边框被破坏: {border:?}");
         }
+
+        let (bx, _) = add_button_zone(Rect::new(84, 29, 36, 1));
+        assert_eq!(buf[(bx, 29)].symbol(), "[", "+ 按钮应渲染在命中区起点");
+        assert_eq!(buf[(bx + 1, 29)].symbol(), "+");
+        assert_eq!(buf[(bx + 2, 29)].symbol(), "]");
     }
 }

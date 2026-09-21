@@ -16,13 +16,19 @@ use crate::ui;
 
 const SCROLLBACK_LEN: usize = 10_000;
 const SCROLL_STEP: i32 = 3;
-const COPY_NOTICE: Duration = Duration::from_secs(3);
+const NOTICE: Duration = Duration::from_secs(3);
 const TRIGGER_SETTLE: Duration = Duration::from_millis(300);
 
 #[cfg(windows)]
 const LINE_SEP: &str = "\r\n";
 #[cfg(not(windows))]
 const LINE_SEP: &str = "\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeKind {
+    Info,
+    Warn,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -34,6 +40,7 @@ pub enum Focus {
 enum IslandHit {
     Body,
     Toggle,
+    Remove,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,10 +97,11 @@ pub struct App {
     pane_inner: Rect,
     layout_area: Rect,
     island_areas: Vec<Rect>,
+    add_bar: Rect,
     paged_panel: Rect,
     scroll: u16,
     selection: Option<Selection>,
-    copy_notice: Option<(usize, Instant)>,
+    notice: Option<(String, Instant, NoticeKind)>,
     focus: Focus,
     trigger_pending: bool,
     last_output_at: Instant,
@@ -104,39 +112,36 @@ impl App {
     pub fn new(config: Config) -> Result<Self> {
         let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
         let area = Rect::new(0, 0, width, height);
-        let pane_inner = ui::terminal_pane_inner(area, &config.ui);
+        let pane_inner = ui::terminal_pane_inner(
+            area,
+            config.ui.left_width,
+            ui::right_pane_width(&config.ui, false),
+        );
         let (rows, cols) = (pane_inner.height.max(1), pane_inner.width.max(1));
-        let heights = [None];
-        let island_areas = ui::island_layout(ui::right_pane_rect(area, &config.ui), &heights);
-        let islands = island_areas
-            .iter()
-            .map(|rect| {
-                let output = ui::island_output_inner(*rect);
-                IslandState::empty(output.height.max(1), output.width.max(1))
-            })
-            .collect();
-        let paged_panel = ui::paged_panel_rect(area, &config.ui);
         let pty = pty::PtySession::spawn(rows, cols)?;
         let term = vt100::Parser::new(rows, cols, SCROLLBACK_LEN);
-        Ok(Self {
+        let mut app = Self {
             config,
             left_page: LeftPage::Jump,
             pty,
             term,
-            islands,
+            islands: vec![IslandState::empty(10, 20)],
             pty_size: (rows, cols),
             pane_inner,
             layout_area: area,
-            island_areas,
-            paged_panel,
+            island_areas: Vec::new(),
+            add_bar: Rect::default(),
+            paged_panel: Rect::default(),
             scroll: 0,
             selection: None,
-            copy_notice: None,
+            notice: None,
             focus: Focus::Terminal,
             trigger_pending: false,
             last_output_at: Instant::now(),
             should_quit: false,
-        })
+        };
+        app.refresh_layout(area)?;
+        Ok(app)
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -173,18 +178,19 @@ impl App {
 
     fn sync_layout(&mut self, terminal: &DefaultTerminal) -> Result<()> {
         let area: Rect = terminal.size()?.into();
-        if area == self.layout_area {
+        if area == self.layout_area && self.island_areas.len() == self.islands.len() {
             return Ok(());
         }
+        self.refresh_layout(area)
+    }
+
+    fn refresh_layout(&mut self, area: Rect) -> Result<()> {
         self.layout_area = area;
-        self.pane_inner = ui::terminal_pane_inner(area, &self.config.ui);
-        let heights: Vec<Option<u16>> = self.islands.iter().map(|i| i.height).collect();
-        self.island_areas = ui::island_layout(ui::right_pane_rect(area, &self.config.ui), &heights);
-        for (island, &rect) in self.islands.iter_mut().zip(self.island_areas.iter()) {
-            let output = ui::island_output_inner(rect);
-            island.resize(output.height.max(1), output.width.max(1));
-        }
-        self.paged_panel = ui::paged_panel_rect(area, &self.config.ui);
+        let left = self.config.ui.left_width;
+        let right = ui::right_pane_width(&self.config.ui, self.islands.is_empty());
+        self.pane_inner = ui::terminal_pane_inner(area, left, right);
+        self.relayout_islands(area, left, right);
+        self.paged_panel = ui::paged_panel_rect(area, left, right);
         let size = (self.pane_inner.height.max(1), self.pane_inner.width.max(1));
         if self.pty_size != size {
             self.pty_size = size;
@@ -192,6 +198,56 @@ impl App {
             self.term.screen_mut().set_size(size.0, size.1);
         }
         Ok(())
+    }
+
+    fn relayout_islands(&mut self, area: Rect, left: u16, right: u16) {
+        let (body, bar) = ui::islands_body_and_bar(ui::right_pane_rect(area, left, right));
+        self.add_bar = bar;
+        let heights: Vec<Option<u16>> = self.islands.iter().map(|i| i.height).collect();
+        self.island_areas = ui::island_layout(body, &heights);
+        for (island, &rect) in self.islands.iter_mut().zip(self.island_areas.iter()) {
+            let output = ui::island_output_inner(rect);
+            island.resize(output.height.max(1), output.width.max(1));
+        }
+    }
+
+    fn add_island(&mut self) -> Result<()> {
+        if self.islands.len() >= self.config.islands.max {
+            self.notify(
+                format!("已达岛上限 {}", self.config.islands.max),
+                NoticeKind::Warn,
+            );
+            return Ok(());
+        }
+        self.islands.push(crate::island::IslandState::empty(10, 20));
+        self.refresh_layout(self.layout_area)?;
+        self.focus = Focus::Island(self.islands.len() - 1);
+        Ok(())
+    }
+
+    fn remove_island(&mut self, index: usize) -> Result<()> {
+        if index >= self.islands.len() {
+            return Ok(());
+        }
+        self.islands.remove(index);
+        self.refresh_layout(self.layout_area)?;
+        self.focus = match self.focus {
+            Focus::Island(i) if i == index => Focus::Terminal,
+            Focus::Island(i) if i > index => Focus::Island(i - 1),
+            other => other,
+        };
+        Ok(())
+    }
+
+    fn remove_focused_island(&mut self) -> Result<()> {
+        if let Focus::Island(i) = self.focus {
+            self.remove_island(i)?;
+        }
+        Ok(())
+    }
+
+    fn notify(&mut self, text: String, kind: NoticeKind) {
+        self.notice = Some((text, Instant::now(), kind));
     }
 
     pub fn scroll(&self) -> u16 {
@@ -211,10 +267,10 @@ impl App {
             .map(|sel| selection_text(&self.term, &sel).chars().count())
     }
 
-    pub fn copy_notice_text(&self) -> Option<String> {
-        self.copy_notice.and_then(|(chars, at)| {
-            (at.elapsed() < COPY_NOTICE).then(|| format!("已复制 {chars} 字符"))
-        })
+    pub fn notice_text(&self) -> Option<(String, NoticeKind)> {
+        self.notice
+            .as_ref()
+            .and_then(|(text, at, kind)| (at.elapsed() < NOTICE).then(|| (text.clone(), *kind)))
     }
 
     fn handle_events(&mut self) -> Result<()> {
@@ -224,7 +280,7 @@ impl App {
         let mut input = Vec::new();
         loop {
             match event::read()? {
-                Event::Key(key) => self.handle_key(key, &mut input),
+                Event::Key(key) => self.handle_key(key, &mut input)?,
                 Event::Paste(text) => match self.focus {
                     Focus::Island(_) => {
                         let line: String =
@@ -233,7 +289,7 @@ impl App {
                     }
                     Focus::Terminal => input.extend_from_slice(&keys::paste_bytes(&text)),
                 },
-                Event::Mouse(mouse) => self.handle_mouse(mouse),
+                Event::Mouse(mouse) => self.handle_mouse(mouse)?,
                 _ => {}
             }
             if self.should_quit || !event::poll(Duration::ZERO)? {
@@ -256,9 +312,9 @@ impl App {
         self.pty.write_input(input)
     }
 
-    fn handle_key(&mut self, key: KeyEvent, input: &mut Vec<u8>) {
+    fn handle_key(&mut self, key: KeyEvent, input: &mut Vec<u8>) -> Result<()> {
         if key.kind == KeyEventKind::Release {
-            return;
+            return Ok(());
         }
         let is_press = key.kind == KeyEventKind::Press;
         if is_press
@@ -270,6 +326,8 @@ impl App {
             self.left_page = self.left_page.next();
         } else if is_press && key.code == KeyCode::F(2) {
             self.cycle_focus();
+        } else if is_press && key.code == KeyCode::F(3) {
+            self.add_island()?;
         } else if is_press
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -292,6 +350,8 @@ impl App {
                         if let Some(island) = self.islands.get_mut(index) {
                             island.reset_scroll();
                         }
+                    } else if is_press && key.code == KeyCode::Delete && key.modifiers.is_empty() {
+                        self.remove_focused_island()?;
                     } else if is_press && key.code == KeyCode::Enter && key.modifiers.is_empty() {
                         self.execute_focused_island();
                     } else if is_press && key.code == KeyCode::Backspace && key.modifiers.is_empty()
@@ -306,6 +366,7 @@ impl App {
                 }
             }
         }
+        Ok(())
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent, is_press: bool, input: &mut Vec<u8>) {
@@ -341,7 +402,7 @@ impl App {
             let text = selection_text(term, &sel);
             let count = text.chars().count();
             if !text.is_empty() && clipboard.set_text(text).is_ok() {
-                self.copy_notice = Some((count, Instant::now()));
+                self.notify(format!("已复制 {count} 字符"), NoticeKind::Info);
             }
         }
     }
@@ -392,22 +453,32 @@ impl App {
         }
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) {
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_mouse(SCROLL_STEP, mouse.column, mouse.row),
             MouseEventKind::ScrollDown => self.scroll_mouse(-SCROLL_STEP, mouse.column, mouse.row),
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some((index, hit)) = self.island_hit(mouse.column, mouse.row) {
-                    self.clear_all_selections();
-                    self.focus = Focus::Island(index);
-                    if hit == IslandHit::Toggle {
-                        self.toggle_island_follow(index);
-                    } else if let Some(pos) = self.island_cell_at(index, mouse.column, mouse.row) {
-                        self.islands[index].selection = Some(Selection {
-                            start: pos,
-                            end: pos,
-                        });
+                    match hit {
+                        IslandHit::Remove => self.remove_island(index)?,
+                        IslandHit::Toggle => {
+                            self.clear_all_selections();
+                            self.focus = Focus::Island(index);
+                            self.toggle_island_follow(index);
+                        }
+                        IslandHit::Body => {
+                            self.clear_all_selections();
+                            self.focus = Focus::Island(index);
+                            if let Some(pos) = self.island_cell_at(index, mouse.column, mouse.row) {
+                                self.islands[index].selection = Some(Selection {
+                                    start: pos,
+                                    end: pos,
+                                });
+                            }
+                        }
                     }
+                } else if self.add_button_hit(mouse.column, mouse.row) {
+                    self.add_island()?;
                 } else if self.jump_button_hit(mouse.column, mouse.row) {
                     self.reset_scroll();
                 } else if let Some(page) =
@@ -455,6 +526,7 @@ impl App {
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn scroll_mouse(&mut self, delta: i32, column: u16, row: u16) {
@@ -493,7 +565,9 @@ impl App {
                 && row >= area.y
                 && row < area.y + area.height
             {
-                let hit = if row == area.y && column + 10 >= area.x + area.width {
+                let hit = if row == area.y && column + 3 >= area.x + area.width {
+                    IslandHit::Remove
+                } else if row == area.y && column + 13 >= area.x + area.width {
                     IslandHit::Toggle
                 } else {
                     IslandHit::Body
@@ -502,6 +576,14 @@ impl App {
             }
         }
         None
+    }
+
+    fn add_button_hit(&self, column: u16, row: u16) -> bool {
+        if row != self.add_bar.y {
+            return false;
+        }
+        let (x, w) = ui::add_button_zone(self.add_bar);
+        column >= x && column < x + w
     }
 
     fn toggle_island_follow(&mut self, index: usize) {
@@ -666,16 +748,21 @@ mod tests {
         let mut input = Vec::new();
 
         assert_eq!(app.focus(), Focus::Terminal);
-        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Island(0));
-        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Island(1));
-        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Terminal);
         assert!(input.is_empty());
 
-        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
-        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Terminal);
     }
 
@@ -683,9 +770,11 @@ mod tests {
     fn f2_with_single_island_round_trips() {
         let mut app = App::new(Config::default()).expect("app");
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Island(0));
-        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Terminal);
     }
 
@@ -693,11 +782,13 @@ mod tests {
     fn island_input_executes_command() {
         let mut app = app_with_islands();
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Island(0));
 
         for ch in "echo island-run-ok".chars() {
-            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input);
+            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input)
+                .unwrap();
         }
         assert_eq!(app.islands[0].command, "echo island-run-ok");
         assert!(input.is_empty(), "岛内输入不应进入 shell");
@@ -705,14 +796,17 @@ mod tests {
         app.handle_key(
             press_key(KeyCode::Backspace, KeyModifiers::NONE),
             &mut input,
-        );
+        )
+        .unwrap();
         assert_eq!(app.islands[0].command, "echo island-run-o");
         app.handle_key(
             press_key(KeyCode::Char('k'), KeyModifiers::NONE),
             &mut input,
-        );
+        )
+        .unwrap();
 
-        app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert!(app.islands[0].session.is_some(), "回车应启动岛进程");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -735,7 +829,8 @@ mod tests {
     fn terminal_focus_sends_tab_to_shell() {
         let mut app = App::new(Config::default()).expect("app");
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Terminal);
         assert_eq!(input, b"\t".to_vec());
     }
@@ -751,30 +846,79 @@ mod tests {
             row: 5,
             modifiers: KeyModifiers::NONE,
         };
-        app.handle_mouse(body_click);
+        app.handle_mouse(body_click).unwrap();
         assert_eq!(app.focus(), Focus::Island(0));
         assert!(!app.islands[0].follow, "点击岛体不应拨动开关");
 
         let toggle_click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: 84,
+            column: 78,
             row: 0,
             modifiers: KeyModifiers::NONE,
         };
-        app.handle_mouse(toggle_click);
+        app.handle_mouse(toggle_click).unwrap();
         assert_eq!(app.focus(), Focus::Island(0));
         assert!(app.islands[0].follow);
         assert!(!app.islands[1].follow, "只拨动被点击的岛");
 
-        app.handle_mouse(toggle_click);
+        app.handle_mouse(toggle_click).unwrap();
         assert!(!app.islands[0].follow, "再次点击应拨回");
+    }
+
+    #[test]
+    fn close_button_removes_island() {
+        let mut app = app_with_islands();
+        app.island_areas = vec![Rect::new(50, 0, 36, 15), Rect::new(50, 15, 36, 15)];
+        let close_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 85,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(close_click).unwrap();
+        assert_eq!(app.islands.len(), 1, "× 应删除岛");
+        assert_eq!(app.focus(), Focus::Terminal, "非聚焦删除后焦点不变");
+    }
+
+    #[test]
+    fn add_button_click_adds_island() {
+        let mut app = app_with_islands();
+        app.refresh_layout(app.layout_area).unwrap();
+
+        let off_button = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.add_bar.x,
+            row: app.add_bar.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(off_button).unwrap();
+        assert_eq!(app.islands.len(), 2, "按钮外的提示栏区域不应新增");
+
+        let (bx, _) = ui::add_button_zone(app.add_bar);
+        let on_button = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: bx + 1,
+            row: app.add_bar.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(on_button).unwrap();
+        assert_eq!(app.islands.len(), 3, "点击 + 按钮应新增岛");
+        assert_eq!(app.focus(), Focus::Island(2), "新岛应被聚焦");
+
+        app.handle_mouse(on_button).unwrap();
+        assert_eq!(app.islands.len(), 3, "达上限后点击不再新增");
+        assert!(
+            app.notice_text()
+                .is_some_and(|(t, kind)| t.contains("上限") && kind == NoticeKind::Warn)
+        );
     }
 
     #[test]
     fn clicking_terminal_returns_focus() {
         let mut app = app_with_islands();
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Island(0));
 
         app.island_areas = Vec::new();
@@ -785,7 +929,7 @@ mod tests {
             row: 5,
             modifiers: KeyModifiers::NONE,
         };
-        app.handle_mouse(click);
+        app.handle_mouse(click).unwrap();
         assert_eq!(app.focus(), Focus::Terminal);
         assert!(app.selection.is_some());
     }
@@ -795,27 +939,34 @@ mod tests {
         let mut app = app_with_islands();
         let mut input = Vec::new();
 
-        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Island(0));
 
-        app.handle_key(press_key(KeyCode::Up, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::Up, KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Island(0), "顶部应钳位");
 
-        app.handle_key(press_key(KeyCode::Down, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::Down, KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Island(1));
-        app.handle_key(press_key(KeyCode::Down, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::Down, KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Island(1), "底部应钳位");
 
-        app.handle_key(press_key(KeyCode::Up, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::Up, KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Island(0));
 
         app.handle_key(
             press_key(KeyCode::Char('a'), KeyModifiers::NONE),
             &mut input,
-        );
+        )
+        .unwrap();
         assert!(input.is_empty(), "岛聚焦时按键不应进入 shell");
 
-        app.handle_key(press_key(KeyCode::Esc, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::Esc, KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.focus(), Focus::Terminal);
     }
 
@@ -823,11 +974,14 @@ mod tests {
     fn clearing_command_resets_island() {
         let mut app = app_with_islands();
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
         for ch in "echo island-reset-marker".chars() {
-            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input);
+            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input)
+                .unwrap();
         }
-        app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input)
+            .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.islands[0].session.is_some() && std::time::Instant::now() < deadline {
             app.islands[0].poll_output();
@@ -845,7 +999,8 @@ mod tests {
             app.handle_key(
                 press_key(KeyCode::Backspace, KeyModifiers::NONE),
                 &mut input,
-            );
+            )
+            .unwrap();
         }
         assert!(app.islands[0].command.is_empty());
         assert!(app.islands[0].session.is_none());
@@ -853,7 +1008,8 @@ mod tests {
         app.handle_key(
             press_key(KeyCode::Char('a'), KeyModifiers::NONE),
             &mut input,
-        );
+        )
+        .unwrap();
         assert!(
             !app.islands[0]
                 .parser
@@ -879,7 +1035,7 @@ mod tests {
             row: 5,
             modifiers: KeyModifiers::NONE,
         };
-        app.handle_mouse(wheel);
+        app.handle_mouse(wheel).unwrap();
         assert_eq!(app.islands[0].scroll, 3);
         assert_eq!(app.scroll(), 0, "主终端不应被岛内滚动影响");
 
@@ -889,7 +1045,7 @@ mod tests {
             row: 5,
             modifiers: KeyModifiers::NONE,
         };
-        app.handle_mouse(outside);
+        app.handle_mouse(outside).unwrap();
         assert!(app.scroll() > 0, "岛外滚动应作用于主终端");
     }
 
@@ -903,7 +1059,7 @@ mod tests {
             row: 2,
             modifiers: KeyModifiers::NONE,
         };
-        app.handle_mouse(down);
+        app.handle_mouse(down).unwrap();
         assert_eq!(app.focus(), Focus::Island(0));
         assert!(app.islands[0].selection.is_some());
 
@@ -913,7 +1069,7 @@ mod tests {
             row: 2,
             modifiers: KeyModifiers::NONE,
         };
-        app.handle_mouse(drag);
+        app.handle_mouse(drag).unwrap();
         let sel = app.islands[0].selection.expect("拖动后选区应存在");
         assert_eq!(sel.normalized(), ((1, 1), (1, 4)));
     }
@@ -923,11 +1079,14 @@ mod tests {
         let mut app = app_with_islands();
         app.islands[0].follow = true;
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
         for ch in "echo live-island-ok".chars() {
-            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input);
+            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input)
+                .unwrap();
         }
-        app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert!(app.islands[0].session.is_some(), "岛应通过 PTY 执行");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -985,11 +1144,14 @@ mod tests {
     fn mode_toggle_preserves_island_state() {
         let mut app = app_with_islands();
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
         for ch in "ping -t 127.0.0.1".chars() {
-            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input);
+            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input)
+                .unwrap();
         }
-        app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert!(app.islands[0].session.is_some());
         app.islands[0].poll_output();
         assert!(
@@ -1013,6 +1175,125 @@ mod tests {
     }
 
     #[test]
+    fn f3_adds_island_and_focuses_it() {
+        let mut app = App::new(Config::default()).expect("app");
+        assert_eq!(app.islands.len(), 1);
+        assert_eq!(app.island_areas.len(), 1);
+
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(3), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        assert_eq!(app.islands.len(), 2, "F3 应新增岛");
+        assert_eq!(app.island_areas.len(), 2, "岛区域应同步重排");
+        assert_eq!(app.focus(), Focus::Island(1), "新岛应被聚焦");
+
+        let output = ui::island_output_inner(app.island_areas[1]);
+        let (rows, cols) = app.islands[1].parser.screen().size();
+        assert_eq!(
+            (rows, cols),
+            (output.height, output.width),
+            "新岛尺寸应匹配区域"
+        );
+        let first = ui::island_output_inner(app.island_areas[0]);
+        let (r0, c0) = app.islands[0].parser.screen().size();
+        assert_eq!((r0, c0), (first.height, first.width), "现有岛应随重排缩放");
+
+        app.handle_key(press_key(KeyCode::F(3), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        assert_eq!(app.islands.len(), 3);
+        app.handle_key(press_key(KeyCode::F(3), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        assert_eq!(app.islands.len(), 3, "达到上限后不应再增");
+        assert!(
+            app.notice_text()
+                .is_some_and(|(t, kind)| t.contains("上限") && kind == NoticeKind::Warn),
+            "达到上限应提示"
+        );
+    }
+
+    #[test]
+    fn del_removes_focused_island() {
+        let mut app = app_with_islands();
+        app.islands[0].command = "ping -t 127.0.0.1".to_owned();
+        app.islands[0].execute();
+        assert!(app.islands[0].session.is_some(), "岛内应有运行中进程");
+
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        assert_eq!(app.focus(), Focus::Island(0));
+        app.handle_key(press_key(KeyCode::Delete, KeyModifiers::NONE), &mut input)
+            .unwrap();
+        assert_eq!(app.islands.len(), 1, "应删除聚焦岛");
+        assert_eq!(app.focus(), Focus::Terminal, "删除聚焦岛后应回中栏");
+        assert_eq!(app.island_areas.len(), 1);
+        assert!(input.is_empty(), "岛聚焦时 Del 不应进 shell");
+    }
+
+    #[test]
+    fn remove_island_shifts_focus_index() {
+        let mut app = App::new(Config::default()).expect("app");
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(3), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        app.handle_key(press_key(KeyCode::F(3), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        assert_eq!(app.islands.len(), 3);
+
+        app.focus = Focus::Island(2);
+        app.remove_island(1).unwrap();
+        assert_eq!(app.islands.len(), 2);
+        assert_eq!(app.focus(), Focus::Island(1), "后方岛焦点索引应左移");
+        assert_eq!(app.island_areas.len(), 2);
+    }
+
+    #[test]
+    fn remove_last_island_then_readd() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.remove_island(0).unwrap();
+        assert!(app.islands.is_empty());
+        assert_eq!(app.focus(), Focus::Terminal);
+
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(3), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        assert_eq!(app.islands.len(), 1);
+        assert_eq!(app.focus(), Focus::Island(0));
+    }
+
+    #[test]
+    fn del_in_terminal_goes_to_shell() {
+        let mut app = App::new(Config::default()).expect("app");
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::Delete, KeyModifiers::NONE), &mut input)
+            .unwrap();
+        assert_eq!(input, b"\x1b[3~".to_vec(), "终端聚焦时 Del 应发给 shell");
+    }
+
+    #[test]
+    fn empty_islands_narrow_right_pane() {
+        let mut app = App::new(Config::default()).expect("app");
+        let wide = app.pane_inner.width;
+        assert!(wide > 0);
+
+        app.remove_island(0).unwrap();
+        assert!(app.islands.is_empty());
+        let narrow_pane = app.pane_inner.width;
+        assert!(
+            narrow_pane > wide,
+            "删光岛后终端应变宽：{wide} → {narrow_pane}"
+        );
+        let expected = wide + (Config::default().ui.right_width - ui::EMPTY_RIGHT_WIDTH);
+        assert_eq!(narrow_pane, expected);
+        assert_eq!(app.pty_size.1, narrow_pane, "PTY 应同步新宽度");
+
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(3), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        assert_eq!(app.pane_inner.width, wide, "加岛后终端应恢复原宽");
+    }
+
+    #[test]
     fn end_key_jumps_to_bottom_when_scrolled() {
         let mut app = App::new(Config::default()).expect("app");
         for i in 0..100 {
@@ -1022,7 +1303,8 @@ mod tests {
         assert_eq!(app.scroll(), 10);
 
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::End, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::End, KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.scroll(), 0);
         assert!(input.is_empty(), "回看时 End 不应发给 shell");
     }
@@ -1031,7 +1313,8 @@ mod tests {
     fn end_key_goes_to_shell_when_live() {
         let mut app = App::new(Config::default()).expect("app");
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::End, KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::End, KeyModifiers::NONE), &mut input)
+            .unwrap();
         assert_eq!(app.scroll(), 0);
         assert_eq!(input, b"\x1b[F".to_vec());
     }
@@ -1052,7 +1335,7 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::NONE,
         };
-        app.handle_mouse(click);
+        app.handle_mouse(click).unwrap();
         assert_eq!(app.scroll(), 0);
 
         let no_hit = MouseEvent {
@@ -1062,7 +1345,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         app.scroll_by(10);
-        app.handle_mouse(no_hit);
+        app.handle_mouse(no_hit).unwrap();
         assert_eq!(app.scroll(), 10, "按钮区域外不应触发回底");
     }
 

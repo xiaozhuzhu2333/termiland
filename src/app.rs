@@ -17,6 +17,7 @@ use crate::ui;
 const SCROLLBACK_LEN: usize = 10_000;
 const SCROLL_STEP: i32 = 3;
 const COPY_NOTICE: Duration = Duration::from_secs(3);
+const TRIGGER_SETTLE: Duration = Duration::from_millis(300);
 
 #[cfg(windows)]
 const LINE_SEP: &str = "\r\n";
@@ -94,6 +95,8 @@ pub struct App {
     selection: Option<Selection>,
     copy_notice: Option<(usize, Instant)>,
     focus: Focus,
+    trigger_pending: bool,
+    last_output_at: Instant,
     should_quit: bool,
 }
 
@@ -130,6 +133,8 @@ impl App {
             selection: None,
             copy_notice: None,
             focus: Focus::Terminal,
+            trigger_pending: false,
+            last_output_at: Instant::now(),
             should_quit: false,
         })
     }
@@ -139,6 +144,7 @@ impl App {
             self.sync_layout(terminal)?;
             let output = self.pty.poll_output();
             if !output.is_empty() {
+                self.last_output_at = Instant::now();
                 self.term.process(&output);
                 let (row, col) = self.term.screen().cursor_position();
                 self.pty.set_cursor_position(row, col);
@@ -146,10 +152,23 @@ impl App {
             for island in &mut self.islands {
                 island.poll_output();
             }
+            self.maybe_trigger_live();
             terminal.draw(|f| ui::draw(f, self))?;
             self.handle_events()?;
         }
         Ok(())
+    }
+
+    fn maybe_trigger_live(&mut self) {
+        if !self.trigger_pending || self.last_output_at.elapsed() < TRIGGER_SETTLE {
+            return;
+        }
+        self.trigger_pending = false;
+        for island in &mut self.islands {
+            if island.follow && island.armed {
+                island.execute();
+            }
+        }
     }
 
     fn sync_layout(&mut self, terminal: &DefaultTerminal) -> Result<()> {
@@ -222,11 +241,19 @@ impl App {
             }
         }
         if !input.is_empty() {
-            self.reset_scroll();
-            self.selection = None;
-            self.pty.write_input(&input)?;
+            self.send_terminal_input(&input)?;
         }
         Ok(())
+    }
+
+    fn send_terminal_input(&mut self, input: &[u8]) -> Result<()> {
+        if input.contains(&b'\r') {
+            self.trigger_pending = true;
+            self.last_output_at = Instant::now();
+        }
+        self.reset_scroll();
+        self.selection = None;
+        self.pty.write_input(input)
     }
 
     fn handle_key(&mut self, key: KeyEvent, input: &mut Vec<u8>) {
@@ -374,7 +401,7 @@ impl App {
                     self.clear_all_selections();
                     self.focus = Focus::Island(index);
                     if hit == IslandHit::Toggle {
-                        self.toggle_island_live(index);
+                        self.toggle_island_follow(index);
                     } else if let Some(pos) = self.island_cell_at(index, mouse.column, mouse.row) {
                         self.islands[index].selection = Some(Selection {
                             start: pos,
@@ -477,9 +504,9 @@ impl App {
         None
     }
 
-    fn toggle_island_live(&mut self, index: usize) {
+    fn toggle_island_follow(&mut self, index: usize) {
         if let Some(island) = self.islands.get_mut(index) {
-            island.toggle_live();
+            island.toggle_follow();
         }
     }
 
@@ -689,7 +716,7 @@ mod tests {
         assert!(app.islands[0].session.is_some(), "回车应启动岛进程");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !app.islands[0].exited && std::time::Instant::now() < deadline {
+        while app.islands[0].session.is_some() && std::time::Instant::now() < deadline {
             app.islands[0].poll_output();
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -726,7 +753,7 @@ mod tests {
         };
         app.handle_mouse(body_click);
         assert_eq!(app.focus(), Focus::Island(0));
-        assert!(!app.islands[0].live, "点击岛体不应拨动开关");
+        assert!(!app.islands[0].follow, "点击岛体不应拨动开关");
 
         let toggle_click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -736,11 +763,11 @@ mod tests {
         };
         app.handle_mouse(toggle_click);
         assert_eq!(app.focus(), Focus::Island(0));
-        assert!(app.islands[0].live);
-        assert!(!app.islands[1].live, "只拨动被点击的岛");
+        assert!(app.islands[0].follow);
+        assert!(!app.islands[1].follow, "只拨动被点击的岛");
 
         app.handle_mouse(toggle_click);
-        assert!(!app.islands[0].live, "再次点击应拨回");
+        assert!(!app.islands[0].follow, "再次点击应拨回");
     }
 
     #[test]
@@ -802,7 +829,7 @@ mod tests {
         }
         app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !app.islands[0].exited && std::time::Instant::now() < deadline {
+        while app.islands[0].session.is_some() && std::time::Instant::now() < deadline {
             app.islands[0].poll_output();
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -889,6 +916,100 @@ mod tests {
         app.handle_mouse(drag);
         let sel = app.islands[0].selection.expect("拖动后选区应存在");
         assert_eq!(sel.normalized(), ((1, 1), (1, 4)));
+    }
+
+    #[test]
+    fn follow_island_runs_command() {
+        let mut app = app_with_islands();
+        app.islands[0].follow = true;
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        for ch in "echo live-island-ok".chars() {
+            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input);
+        }
+        app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input);
+        assert!(app.islands[0].session.is_some(), "岛应通过 PTY 执行");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.islands[0].session.is_some() && std::time::Instant::now() < deadline {
+            app.islands[0].poll_output();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            app.islands[0]
+                .parser
+                .screen()
+                .contents()
+                .contains("live-island-ok")
+        );
+        assert!(app.islands[0].armed);
+    }
+
+    #[test]
+    fn terminal_activity_triggers_armed_follow_islands() {
+        let mut app = app_with_islands();
+        app.islands[0].follow = true;
+        app.islands[0].armed = true;
+        app.islands[0].command = "echo trigger-test".to_owned();
+        app.islands[1].follow = true;
+        app.islands[1].armed = false;
+        app.islands[1].command = "echo unarmed".to_owned();
+
+        app.trigger_pending = true;
+        app.last_output_at = Instant::now() - Duration::from_millis(400);
+        app.maybe_trigger_live();
+        assert!(!app.trigger_pending, "触发后应清除待触发标记");
+        assert!(app.islands[0].session.is_some(), "已武装的跟随岛应重新执行");
+        assert!(
+            app.islands[1].session.is_none(),
+            "未武装（未回车执行过）的岛不应被触发"
+        );
+
+        app.trigger_pending = true;
+        app.last_output_at = Instant::now();
+        app.maybe_trigger_live();
+        assert!(app.trigger_pending, "输出未安静时不应触发");
+    }
+
+    #[test]
+    fn enter_in_terminal_arms_trigger() {
+        let mut app = app_with_islands();
+        app.send_terminal_input(b"dir\r").unwrap();
+        assert!(app.trigger_pending, "含回车的输入应标记待触发");
+        app.trigger_pending = false;
+        app.send_terminal_input(b"abc").unwrap();
+        assert!(!app.trigger_pending, "无回车的输入不应标记");
+    }
+
+    #[test]
+    fn mode_toggle_preserves_island_state() {
+        let mut app = app_with_islands();
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        for ch in "ping -t 127.0.0.1".chars() {
+            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input);
+        }
+        app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input);
+        assert!(app.islands[0].session.is_some());
+        app.islands[0].poll_output();
+        assert!(
+            app.islands[0]
+                .session
+                .as_ref()
+                .is_some_and(|s| s.is_alive()),
+            "ping 应持续运行"
+        );
+
+        assert!(!app.islands[0].follow);
+        app.toggle_island_follow(0);
+        assert!(app.islands[0].follow, "拨到跟随");
+        assert!(app.islands[0].session.is_some(), "拨动不应杀进程");
+        assert_eq!(app.islands[0].command, "ping -t 127.0.0.1");
+        assert!(app.islands[0].armed, "拨动不应解除武装");
+
+        app.toggle_island_follow(0);
+        assert!(!app.islands[0].follow, "拨回单次");
+        assert!(app.islands[0].session.is_some());
     }
 
     #[test]

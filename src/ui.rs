@@ -315,8 +315,8 @@ fn render_island(f: &mut Frame, area: Rect, island: &IslandState, focused: bool)
     } else {
         island.command.clone()
     };
-    let (badge, badge_color) = if island.live {
-        ("◉ 实时", Color::Green)
+    let (badge, badge_color) = if island.follow {
+        ("◉ 跟随", Color::Green)
     } else {
         ("○ 单次", Color::DarkGray)
     };

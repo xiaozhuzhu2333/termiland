@@ -7,10 +7,11 @@ const ISLAND_SCROLLBACK: usize = 1000;
 
 pub struct IslandState {
     pub command: String,
-    pub live: bool,
+    pub follow: bool,
     pub height: Option<u16>,
     pub parser: vt100::Parser,
     pub session: Option<PtySession>,
+    pub armed: bool,
     pub exited: bool,
     pub scroll: u16,
     pub selection: Option<Selection>,
@@ -20,10 +21,11 @@ impl IslandState {
     pub fn empty(rows: u16, cols: u16) -> Self {
         Self {
             command: String::new(),
-            live: false,
+            follow: false,
             height: None,
             parser: vt100::Parser::new(rows, cols, ISLAND_SCROLLBACK),
             session: None,
+            armed: false,
             exited: false,
             scroll: 0,
             selection: None,
@@ -38,6 +40,7 @@ impl IslandState {
         let (rows, cols) = self.parser.screen().size();
         self.parser = vt100::Parser::new(rows, cols, ISLAND_SCROLLBACK);
         self.exited = false;
+        self.armed = true;
         self.scroll = 0;
         self.selection = None;
         match PtySession::spawn_command(shell_command(&self.command), rows, cols) {
@@ -55,6 +58,7 @@ impl IslandState {
         let (rows, cols) = self.parser.screen().size();
         self.parser = vt100::Parser::new(rows, cols, ISLAND_SCROLLBACK);
         self.exited = false;
+        self.armed = false;
         self.scroll = 0;
         self.selection = None;
     }
@@ -104,8 +108,8 @@ impl IslandState {
         self.scroll = 0;
     }
 
-    pub fn toggle_live(&mut self) {
-        self.live = !self.live;
+    pub fn toggle_follow(&mut self) {
+        self.follow = !self.follow;
     }
 }
 

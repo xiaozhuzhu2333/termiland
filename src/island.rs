@@ -5,6 +5,34 @@ use crate::pty::PtySession;
 
 const ISLAND_SCROLLBACK: usize = 1000;
 
+pub fn sanitize_resize_boundary(parser: &mut vt100::Parser, new_cols: u16) {
+    if new_cols == 0 {
+        return;
+    }
+    let (rows, cols) = parser.screen().size();
+    if new_cols >= cols {
+        return;
+    }
+    let boundary = new_cols - 1;
+    let bad_rows: Vec<u16> = (0..rows)
+        .filter(|&row| {
+            parser
+                .screen()
+                .cell(row, boundary)
+                .is_some_and(|c| c.is_wide() || c.is_wide_continuation())
+        })
+        .collect();
+    if bad_rows.is_empty() {
+        return;
+    }
+    let mut seq = String::from("\x1b7");
+    for row in bad_rows {
+        seq.push_str(&format!("\x1b[{row};{new_cols}H "));
+    }
+    seq.push_str("\x1b8");
+    parser.process(seq.as_bytes());
+}
+
 pub struct IslandState {
     pub command: String,
     pub follow: bool,
@@ -82,6 +110,7 @@ impl IslandState {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        sanitize_resize_boundary(&mut self.parser, cols);
         self.parser.screen_mut().set_size(rows, cols);
         if let Some(session) = &mut self.session {
             let _ = session.resize(rows, cols);

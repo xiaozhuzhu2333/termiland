@@ -9,7 +9,7 @@ use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
 use crate::config::Config;
-use crate::island::IslandState;
+use crate::island::{IslandState, sanitize_resize_boundary};
 use crate::keys;
 use crate::pty;
 use crate::ui;
@@ -195,6 +195,7 @@ impl App {
         if self.pty_size != size {
             self.pty_size = size;
             self.pty.resize(size.0, size.1)?;
+            sanitize_resize_boundary(&mut self.term, size.1);
             self.term.screen_mut().set_size(size.0, size.1);
         }
         Ok(())
@@ -1291,6 +1292,34 @@ mod tests {
         app.handle_key(press_key(KeyCode::F(3), KeyModifiers::NONE), &mut input)
             .unwrap();
         assert_eq!(app.pane_inner.width, wide, "加岛后终端应恢复原宽");
+    }
+
+    #[test]
+    fn shrink_with_wide_char_at_boundary_no_panic() {
+        let mut parser = vt100::Parser::new(2, 10, 0);
+        parser.process("     \u{4e2d}".as_bytes());
+        assert!(
+            parser.screen().cell(0, 5).unwrap().is_wide(),
+            "宽字符应占 5-6 列"
+        );
+
+        crate::island::sanitize_resize_boundary(&mut parser, 6);
+        parser.screen_mut().set_size(2, 6);
+        parser.process(b"xabcdef");
+        assert!(
+            !parser.screen().cell(0, 5).unwrap().is_wide(),
+            "新边界列的悬空宽字符应已被空格覆盖"
+        );
+    }
+
+    #[test]
+    fn sanitize_skips_when_not_shrinking() {
+        let mut parser = vt100::Parser::new(2, 10, 0);
+        parser.process("     \u{4e2d}".as_bytes());
+        let before = parser.screen().contents();
+        crate::island::sanitize_resize_boundary(&mut parser, 10);
+        crate::island::sanitize_resize_boundary(&mut parser, 12);
+        assert_eq!(parser.screen().contents(), before, "不收窄时净化应为无操作");
     }
 
     #[test]

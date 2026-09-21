@@ -4,8 +4,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::app::{App, Focus, LeftPage};
-use crate::config::{CommandsConfig, Island, JumpConfig, UiConfig};
+use crate::app::{App, Focus, LeftPage, Selection};
+use crate::config::{CommandsConfig, JumpConfig, UiConfig};
+use crate::island::IslandState;
 
 fn focus_border(focused: bool) -> Style {
     if focused {
@@ -62,18 +63,35 @@ pub fn paged_panel_rect(area: Rect, config: &UiConfig) -> Rect {
     panel
 }
 
-pub fn island_layout(area: Rect, islands: &[Island]) -> Vec<Rect> {
-    if islands.is_empty() {
+pub fn island_layout(area: Rect, heights: &[Option<u16>]) -> Vec<Rect> {
+    if heights.is_empty() {
         return Vec::new();
     }
-    let constraints: Vec<Constraint> = islands
+    let constraints: Vec<Constraint> = heights
         .iter()
-        .map(|i| match i.height {
-            Some(h) => Constraint::Length(h.max(3)),
+        .map(|h| match h {
+            Some(h) => Constraint::Length((*h).max(3)),
             None => Constraint::Fill(1),
         })
         .collect();
     Layout::vertical(constraints).split(area).to_vec()
+}
+
+pub fn island_inner(rect: Rect) -> Rect {
+    Rect {
+        x: rect.x.saturating_add(1),
+        y: rect.y.saturating_add(1),
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    }
+}
+
+pub fn island_output_inner(rect: Rect) -> Rect {
+    let inner = island_inner(rect);
+    Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    }
 }
 
 pub fn terminal_pane_inner(area: Rect, config: &UiConfig) -> Rect {
@@ -147,9 +165,18 @@ fn terminal_pane(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let screen = app.term.screen();
+    render_screen(f, inner, app.term.screen(), app.selection());
+
+    if app.pty.is_alive() && app.focus() == Focus::Terminal && app.scroll() == 0 {
+        let (cursor_row, cursor_col) = app.term.screen().cursor_position();
+        if cursor_row < inner.height && cursor_col < inner.width {
+            f.set_cursor_position((inner.x + cursor_col, inner.y + cursor_row));
+        }
+    }
+}
+
+fn render_screen(f: &mut Frame, inner: Rect, screen: &vt100::Screen, selection: Option<Selection>) {
     let (rows, cols) = screen.size();
-    let selection = app.selection();
     for row in 0..rows.min(inner.height) {
         for col in 0..cols.min(inner.width) {
             let Some(cell) = screen.cell(row, col) else {
@@ -174,13 +201,6 @@ fn terminal_pane(f: &mut Frame, area: Rect, app: &App) {
             f.buffer_mut()[(inner.x + col, inner.y + row)]
                 .set_symbol(symbol)
                 .set_style(style);
-        }
-    }
-
-    if app.pty.is_alive() && app.scroll() == 0 {
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        if cursor_row < inner.height && cursor_col < inner.width {
-            f.set_cursor_position((inner.x + cursor_col, inner.y + cursor_row));
         }
     }
 }
@@ -279,51 +299,84 @@ fn page_tabs(page: LeftPage) -> Line<'static> {
 
 fn islands_column(f: &mut Frame, area: Rect, app: &App) {
     if app.islands.is_empty() {
-        placeholder(
-            f,
-            area,
-            "岛",
-            "未配置（参考 config.example.toml）",
-            focus_border(false),
-        );
+        placeholder(f, area, "岛", "无岛", focus_border(false));
         return;
     }
-    let areas = island_layout(area, &app.islands);
+    let heights: Vec<Option<u16>> = app.islands.iter().map(|i| i.height).collect();
+    let areas = island_layout(area, &heights);
     for (index, (island, &island_area)) in app.islands.iter().zip(areas.iter()).enumerate() {
         render_island(f, island_area, island, app.focus() == Focus::Island(index));
     }
 }
 
-fn render_island(f: &mut Frame, area: Rect, island: &Island, focused: bool) {
-    let title = island
-        .name
-        .clone()
-        .unwrap_or_else(|| island.command.clone());
-    let (toggle, color) = if island.live {
+fn render_island(f: &mut Frame, area: Rect, island: &IslandState, focused: bool) {
+    let title = if island.command.is_empty() {
+        "岛".to_owned()
+    } else {
+        island.command.clone()
+    };
+    let (badge, badge_color) = if island.live {
         ("◉ 实时", Color::Green)
     } else {
-        ("○ 触发", Color::DarkGray)
+        ("○ 单次", Color::DarkGray)
     };
-    let block = Block::bordered()
+    let mut badge_spans = Vec::new();
+    if island.scroll > 0 {
+        badge_spans.push(Span::styled(
+            format!("↑ {}  ", island.scroll),
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
+    badge_spans.push(Span::styled(badge, Style::new().fg(badge_color)));
+    let mut block = Block::bordered()
         .border_style(focus_border(focused))
         .title(title)
-        .title_top(Line::from(Span::styled(toggle, Style::new().fg(color))).right_aligned());
-    let block = if focused {
-        block.title_bottom(
+        .title_top(Line::from(badge_spans).right_aligned());
+    if focused {
+        block = block.title_bottom(
             Line::from(Span::styled(
-                "↑↓ 切换 · Esc 返回",
+                "↑↓ 切换 · 回车执行 · Esc 返回",
                 Style::new().fg(Color::DarkGray),
             ))
             .right_aligned(),
-        )
-    } else {
-        block
-    };
-    let body = Paragraph::new(Span::styled(
-        format!("M4 · {}", island.command),
-        Style::new().fg(Color::DarkGray),
-    ));
-    f.render_widget(body.block(block), area);
+        );
+    }
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if island.command.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "聚焦后输入命令 · 回车执行",
+                Style::new().fg(Color::DarkGray),
+            ))
+            .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    let [output, input] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    render_screen(f, output, island.parser.screen(), island.selection);
+    let prompt = Line::from(vec![
+        Span::styled(
+            "> ",
+            Style::new().fg(if focused {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::raw(island.command.clone()),
+    ]);
+    f.render_widget(Paragraph::new(prompt), input);
+    if focused {
+        let cursor_x = input.x + 2 + display_width(&island.command);
+        if cursor_x < input.x + input.width {
+            f.set_cursor_position((cursor_x, input.y));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -369,30 +422,14 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         use crate::app::App;
-        use crate::config::{CommandsConfig, Config, Island, IslandsConfig, JumpConfig, UiConfig};
+        use crate::config::{CommandsConfig, Config, IslandsConfig, JumpConfig, UiConfig};
 
         let config = Config {
             ui: UiConfig {
                 left_width: 22,
                 right_width: 36,
             },
-            islands: IslandsConfig {
-                max: 3,
-                items: vec![
-                    Island {
-                        name: Some("history".to_owned()),
-                        command: "tail -n 30 $HISTFILE".to_owned(),
-                        height: Some(12),
-                        live: false,
-                    },
-                    Island {
-                        name: Some("top".to_owned()),
-                        command: "top".to_owned(),
-                        height: Some(20),
-                        live: true,
-                    },
-                ],
-            },
+            islands: IslandsConfig { max: 3 },
             jump: JumpConfig::default(),
             commands: CommandsConfig::default(),
         };

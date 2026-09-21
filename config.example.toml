@@ -5,22 +5,15 @@ left_width = 22   # 左栏宽度（列）
 right_width = 36  # 右栏宽度（列）
 
 [islands]
-max = 3  # 岛数量上限
+max = 3  # 岛数量上限；岛的命令在运行时输入，无需配置
 
-[[islands.items]]
-name = "history"                  # 岛边框标题（可省略，缺省用命令本身）
-command = "tail -n 30 $HISTFILE"  # 岛内运行的命令
-height = 12                       # 岛高度（行，含边框；可省略，省略则平分剩余空间）
-# live = false                   # 实时开关初始状态（默认 false：中栏执行命令后刷新；运行时可拨动）
-
-[[islands.items]]
-name = "top"
-command = "top"
-height = 20
-live = true  # true：命令持续输出、自身刷新（适合 top / tail -f）
+# 岛使用方式：F2 聚焦岛 → 输入命令 → 回车执行
+#   ◉ 实时：中栏每执行完一条命令，岛重新执行一次自己的命令（适合 df / history 类快照命令）
+#   ○ 单次：执行一次，输出持续显示（适合 top / ping -t / tail -f 类持续输出命令）
+# 点击岛右上角徽标可切换模式
 
 [jump]
-bookmarks = ["/var/log", "/etc/nginx", "/data"]  # 左下「跳转」页：收藏目录（最近访问由运行时记录）
+bookmarks = ["/var/log", "/etc/nginx", "/data"]  # 左下「跳转」页：收藏目录
 
 [[commands.items]]  # 左下「命令」页：常用命令，选中后发送到中栏执行
 name = "服务状态"

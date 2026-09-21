@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod config;
+mod island;
 mod keys;
 mod pty;
 mod ui;

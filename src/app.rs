@@ -8,7 +8,8 @@ use crossterm::event::{
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
-use crate::config::{Config, Island};
+use crate::config::Config;
+use crate::island::IslandState;
 use crate::keys;
 use crate::pty;
 use crate::ui;
@@ -83,7 +84,7 @@ pub struct App {
     pub left_page: LeftPage,
     pub pty: pty::PtySession,
     pub term: vt100::Parser,
-    pub islands: Vec<Island>,
+    pub islands: Vec<IslandState>,
     pty_size: (u16, u16),
     pane_inner: Rect,
     layout_area: Rect,
@@ -102,8 +103,15 @@ impl App {
         let area = Rect::new(0, 0, width, height);
         let pane_inner = ui::terminal_pane_inner(area, &config.ui);
         let (rows, cols) = (pane_inner.height.max(1), pane_inner.width.max(1));
-        let islands = config.islands.items.clone();
-        let island_areas = ui::island_layout(ui::right_pane_rect(area, &config.ui), &islands);
+        let heights = [None];
+        let island_areas = ui::island_layout(ui::right_pane_rect(area, &config.ui), &heights);
+        let islands = island_areas
+            .iter()
+            .map(|rect| {
+                let output = ui::island_output_inner(*rect);
+                IslandState::empty(output.height.max(1), output.width.max(1))
+            })
+            .collect();
         let paged_panel = ui::paged_panel_rect(area, &config.ui);
         let pty = pty::PtySession::spawn(rows, cols)?;
         let term = vt100::Parser::new(rows, cols, SCROLLBACK_LEN);
@@ -135,6 +143,9 @@ impl App {
                 let (row, col) = self.term.screen().cursor_position();
                 self.pty.set_cursor_position(row, col);
             }
+            for island in &mut self.islands {
+                island.poll_output();
+            }
             terminal.draw(|f| ui::draw(f, self))?;
             self.handle_events()?;
         }
@@ -148,8 +159,12 @@ impl App {
         }
         self.layout_area = area;
         self.pane_inner = ui::terminal_pane_inner(area, &self.config.ui);
-        self.island_areas =
-            ui::island_layout(ui::right_pane_rect(area, &self.config.ui), &self.islands);
+        let heights: Vec<Option<u16>> = self.islands.iter().map(|i| i.height).collect();
+        self.island_areas = ui::island_layout(ui::right_pane_rect(area, &self.config.ui), &heights);
+        for (island, &rect) in self.islands.iter_mut().zip(self.island_areas.iter()) {
+            let output = ui::island_output_inner(rect);
+            island.resize(output.height.max(1), output.width.max(1));
+        }
         self.paged_panel = ui::paged_panel_rect(area, &self.config.ui);
         let size = (self.pane_inner.height.max(1), self.pane_inner.width.max(1));
         if self.pty_size != size {
@@ -191,7 +206,14 @@ impl App {
         loop {
             match event::read()? {
                 Event::Key(key) => self.handle_key(key, &mut input),
-                Event::Paste(text) => input.extend_from_slice(&keys::paste_bytes(&text)),
+                Event::Paste(text) => match self.focus {
+                    Focus::Island(_) => {
+                        let line: String =
+                            text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+                        self.edit_focused_command(Some(&line));
+                    }
+                    Focus::Terminal => input.extend_from_slice(&keys::paste_bytes(&text)),
+                },
                 Event::Mouse(mouse) => self.handle_mouse(mouse),
                 _ => {}
             }
@@ -221,10 +243,16 @@ impl App {
             self.left_page = self.left_page.next();
         } else if is_press && key.code == KeyCode::F(2) {
             self.cycle_focus();
+        } else if is_press
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.has_focused_selection()
+        {
+            self.copy_focused_selection();
         } else {
             match self.focus {
                 Focus::Terminal => self.handle_terminal_key(key, is_press, input),
-                Focus::Island(_) => {
+                Focus::Island(index) => {
                     if is_press
                         && matches!(key.code, KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc)
                     {
@@ -233,6 +261,20 @@ impl App {
                         self.move_island_focus(-1);
                     } else if is_press && key.code == KeyCode::Down {
                         self.move_island_focus(1);
+                    } else if is_press && key.code == KeyCode::End && key.modifiers.is_empty() {
+                        if let Some(island) = self.islands.get_mut(index) {
+                            island.reset_scroll();
+                        }
+                    } else if is_press && key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                        self.execute_focused_island();
+                    } else if is_press && key.code == KeyCode::Backspace && key.modifiers.is_empty()
+                    {
+                        self.edit_focused_command(None);
+                    } else if is_press
+                        && let KeyCode::Char(c) = key.code
+                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                    {
+                        self.edit_focused_command(Some(&c.to_string()));
                     }
                 }
             }
@@ -240,20 +282,40 @@ impl App {
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent, is_press: bool, input: &mut Vec<u8>) {
-        if is_press
-            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && self.selection.is_some()
-        {
-            self.copy_selection();
-        } else if is_press
-            && key.code == KeyCode::End
-            && key.modifiers.is_empty()
-            && self.scroll > 0
-        {
+        if is_press && key.code == KeyCode::End && key.modifiers.is_empty() && self.scroll > 0 {
             self.reset_scroll();
         } else if let Some(bytes) = keys::encode(&key) {
             input.extend_from_slice(&bytes);
+        }
+    }
+
+    fn has_focused_selection(&self) -> bool {
+        match self.focus {
+            Focus::Terminal => self.selection.is_some(),
+            Focus::Island(i) => self
+                .islands
+                .get(i)
+                .is_some_and(|island| island.selection.is_some()),
+        }
+    }
+
+    fn copy_focused_selection(&mut self) {
+        let (term, sel) = match self.focus {
+            Focus::Terminal => (&self.term, self.selection),
+            Focus::Island(i) => match self.islands.get(i) {
+                Some(island) => (&island.parser, island.selection),
+                None => return,
+            },
+        };
+        let Some(sel) = sel else {
+            return;
+        };
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            let text = selection_text(term, &sel);
+            let count = text.chars().count();
+            if !text.is_empty() && clipboard.set_text(text).is_ok() {
+                self.copy_notice = Some((count, Instant::now()));
+            }
         }
     }
 
@@ -277,16 +339,47 @@ impl App {
         }
     }
 
+    fn edit_focused_command(&mut self, text: Option<&str>) {
+        if let Focus::Island(i) = self.focus
+            && let Some(island) = self.islands.get_mut(i)
+        {
+            match text {
+                Some(t) => island.command.push_str(t),
+                None => {
+                    island.command.pop();
+                    if island.command.is_empty() {
+                        island.clear();
+                    }
+                }
+            }
+            island.selection = None;
+            island.reset_scroll();
+        }
+    }
+
+    fn execute_focused_island(&mut self) {
+        if let Focus::Island(i) = self.focus
+            && let Some(island) = self.islands.get_mut(i)
+        {
+            island.execute();
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_by(SCROLL_STEP),
-            MouseEventKind::ScrollDown => self.scroll_by(-SCROLL_STEP),
+            MouseEventKind::ScrollUp => self.scroll_mouse(SCROLL_STEP, mouse.column, mouse.row),
+            MouseEventKind::ScrollDown => self.scroll_mouse(-SCROLL_STEP, mouse.column, mouse.row),
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some((index, hit)) = self.island_hit(mouse.column, mouse.row) {
-                    self.selection = None;
+                    self.clear_all_selections();
                     self.focus = Focus::Island(index);
                     if hit == IslandHit::Toggle {
                         self.toggle_island_live(index);
+                    } else if let Some(pos) = self.island_cell_at(index, mouse.column, mouse.row) {
+                        self.islands[index].selection = Some(Selection {
+                            start: pos,
+                            end: pos,
+                        });
                     }
                 } else if self.jump_button_hit(mouse.column, mouse.row) {
                     self.reset_scroll();
@@ -295,18 +388,26 @@ impl App {
                 {
                     self.left_page = page;
                 } else if let Some(pos) = self.term_cell_at(mouse.column, mouse.row) {
+                    self.clear_all_selections();
                     self.focus = Focus::Terminal;
                     self.selection = Some(Selection {
                         start: pos,
                         end: pos,
                     });
                 } else {
-                    self.selection = None;
+                    self.clear_all_selections();
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(pos) = self.term_cell_at(mouse.column, mouse.row)
-                    && let Some(sel) = &mut self.selection
+                if self.selection.is_some() {
+                    if let Some(pos) = self.term_cell_at(mouse.column, mouse.row)
+                        && let Some(sel) = &mut self.selection
+                    {
+                        sel.end = pos;
+                    }
+                } else if let Some(index) = self.islands.iter().position(|i| i.selection.is_some())
+                    && let Some(pos) = self.island_cell_at(index, mouse.column, mouse.row)
+                    && let Some(sel) = &mut self.islands[index].selection
                 {
                     sel.end = pos;
                 }
@@ -317,8 +418,44 @@ impl App {
                 {
                     self.selection = None;
                 }
+                for island in &mut self.islands {
+                    if let Some(sel) = &mut island.selection
+                        && sel.start == sel.end
+                    {
+                        island.selection = None;
+                    }
+                }
             }
             _ => {}
+        }
+    }
+
+    fn scroll_mouse(&mut self, delta: i32, column: u16, row: u16) {
+        if let Some((index, _)) = self.island_hit(column, row) {
+            self.islands[index].scroll_by(delta);
+        } else {
+            self.scroll_by(delta);
+        }
+    }
+
+    fn clear_all_selections(&mut self) {
+        self.selection = None;
+        for island in &mut self.islands {
+            island.selection = None;
+        }
+    }
+
+    fn island_cell_at(&self, index: usize, column: u16, row: u16) -> Option<(u16, u16)> {
+        let rect = self.island_areas.get(index)?;
+        let output = ui::island_output_inner(*rect);
+        if column >= output.x
+            && column < output.x + output.width
+            && row >= output.y
+            && row < output.y + output.height
+        {
+            Some((row - output.y, column - output.x))
+        } else {
+            None
         }
     }
 
@@ -342,7 +479,7 @@ impl App {
 
     fn toggle_island_live(&mut self, index: usize) {
         if let Some(island) = self.islands.get_mut(index) {
-            island.live = !island.live;
+            island.toggle_live();
         }
     }
 
@@ -354,18 +491,6 @@ impl App {
         let corner = pane.x + pane.width;
         let border_row = pane.y.saturating_sub(1);
         row == border_row && column + 8 >= corner && column <= corner
-    }
-
-    fn copy_selection(&mut self) {
-        if let Some(sel) = self.selection
-            && let Ok(mut clipboard) = arboard::Clipboard::new()
-        {
-            let text = selection_text(&self.term, &sel);
-            let count = text.chars().count();
-            if !text.is_empty() && clipboard.set_text(text).is_ok() {
-                self.copy_notice = Some((count, Instant::now()));
-            }
-        }
     }
 
     fn term_cell_at(&self, column: u16, row: u16) -> Option<(u16, u16)> {
@@ -502,22 +627,10 @@ mod tests {
     }
 
     fn app_with_islands() -> App {
-        let mut config = Config::default();
-        config.islands.items = vec![
-            Island {
-                name: None,
-                command: "a".to_owned(),
-                height: None,
-                live: false,
-            },
-            Island {
-                name: None,
-                command: "b".to_owned(),
-                height: None,
-                live: false,
-            },
-        ];
-        App::new(config).expect("app")
+        let mut app = App::new(Config::default()).expect("app");
+        app.islands.push(crate::island::IslandState::empty(10, 36));
+        app.island_areas = vec![Rect::new(50, 0, 36, 15), Rect::new(50, 15, 36, 15)];
+        app
     }
 
     #[test]
@@ -540,11 +653,55 @@ mod tests {
     }
 
     #[test]
-    fn f2_without_islands_stays_terminal() {
+    fn f2_with_single_island_round_trips() {
         let mut app = App::new(Config::default()).expect("app");
         let mut input = Vec::new();
         app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Island(0));
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
         assert_eq!(app.focus(), Focus::Terminal);
+    }
+
+    #[test]
+    fn island_input_executes_command() {
+        let mut app = app_with_islands();
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Island(0));
+
+        for ch in "echo island-run-ok".chars() {
+            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input);
+        }
+        assert_eq!(app.islands[0].command, "echo island-run-ok");
+        assert!(input.is_empty(), "岛内输入不应进入 shell");
+
+        app.handle_key(
+            press_key(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut input,
+        );
+        assert_eq!(app.islands[0].command, "echo island-run-o");
+        app.handle_key(
+            press_key(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut input,
+        );
+
+        app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input);
+        assert!(app.islands[0].session.is_some(), "回车应启动岛进程");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.islands[0].exited && std::time::Instant::now() < deadline {
+            app.islands[0].poll_output();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            app.islands[0]
+                .parser
+                .screen()
+                .contents()
+                .contains("island-run-ok"),
+            "岛屏幕应包含命令输出"
+        );
+        assert!(input.is_empty());
     }
 
     #[test]
@@ -633,6 +790,105 @@ mod tests {
 
         app.handle_key(press_key(KeyCode::Esc, KeyModifiers::NONE), &mut input);
         assert_eq!(app.focus(), Focus::Terminal);
+    }
+
+    #[test]
+    fn clearing_command_resets_island() {
+        let mut app = app_with_islands();
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        for ch in "echo island-reset-marker".chars() {
+            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input);
+        }
+        app.handle_key(press_key(KeyCode::Enter, KeyModifiers::NONE), &mut input);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.islands[0].exited && std::time::Instant::now() < deadline {
+            app.islands[0].poll_output();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            app.islands[0]
+                .parser
+                .screen()
+                .contents()
+                .contains("island-reset-marker")
+        );
+
+        for _ in 0.."echo island-reset-marker".len() {
+            app.handle_key(
+                press_key(KeyCode::Backspace, KeyModifiers::NONE),
+                &mut input,
+            );
+        }
+        assert!(app.islands[0].command.is_empty());
+        assert!(app.islands[0].session.is_none());
+
+        app.handle_key(
+            press_key(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut input,
+        );
+        assert!(
+            !app.islands[0]
+                .parser
+                .screen()
+                .contents()
+                .contains("island-reset-marker")
+        );
+        assert_eq!(app.islands[0].command, "a");
+    }
+
+    #[test]
+    fn wheel_over_island_scrolls_it() {
+        let mut app = app_with_islands();
+        for i in 0..100 {
+            app.islands[0]
+                .parser
+                .process(format!("line{i}\r\n").as_bytes());
+            app.term.process(format!("tline{i}\r\n").as_bytes());
+        }
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 60,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel);
+        assert_eq!(app.islands[0].scroll, 3);
+        assert_eq!(app.scroll(), 0, "主终端不应被岛内滚动影响");
+
+        let outside = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(outside);
+        assert!(app.scroll() > 0, "岛外滚动应作用于主终端");
+    }
+
+    #[test]
+    fn island_mouse_selection_and_drag() {
+        let mut app = app_with_islands();
+        app.islands[0].parser.process(b"hello island");
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 52,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(down);
+        assert_eq!(app.focus(), Focus::Island(0));
+        assert!(app.islands[0].selection.is_some());
+
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 55,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(drag);
+        let sel = app.islands[0].selection.expect("拖动后选区应存在");
+        assert_eq!(sel.normalized(), ((1, 1), (1, 4)));
     }
 
     #[test]

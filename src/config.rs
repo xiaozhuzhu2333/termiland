@@ -31,26 +31,12 @@ impl Default for UiConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct IslandsConfig {
     pub max: usize,
-    pub items: Vec<Island>,
 }
 
 impl Default for IslandsConfig {
     fn default() -> Self {
-        Self {
-            max: 3,
-            items: Vec::new(),
-        }
+        Self { max: 3 }
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Island {
-    pub name: Option<String>,
-    pub command: String,
-    pub height: Option<u16>,
-    #[serde(default)]
-    pub live: bool,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -117,7 +103,6 @@ mod tests {
         assert_eq!(cfg.ui.left_width, 22);
         assert_eq!(cfg.ui.right_width, 36);
         assert_eq!(cfg.islands.max, 3);
-        assert!(cfg.islands.items.is_empty());
         assert!(cfg.jump.bookmarks.is_empty());
         assert!(cfg.commands.items.is_empty());
     }
@@ -132,17 +117,6 @@ right_width = 50
 [islands]
 max = 2
 
-[[islands.items]]
-name = "history"
-command = "tail -n 30 $HISTFILE"
-height = 12
-
-[[islands.items]]
-name = "top"
-command = "top"
-height = 20
-live = true
-
 [jump]
 bookmarks = ["/var/log", "/data"]
 
@@ -156,10 +130,6 @@ command = "df -h"
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.ui.left_width, 30);
         assert_eq!(cfg.islands.max, 2);
-        assert_eq!(cfg.islands.items.len(), 2);
-        assert!(!cfg.islands.items[0].live);
-        assert!(cfg.islands.items[1].live);
-        assert_eq!(cfg.islands.items[1].height, Some(20));
         assert_eq!(cfg.jump.bookmarks, ["/var/log", "/data"]);
         assert_eq!(cfg.commands.items.len(), 2);
         assert!(cfg.commands.items[0].name.is_some());

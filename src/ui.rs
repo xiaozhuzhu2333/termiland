@@ -4,8 +4,16 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::app::{App, LeftPage};
+use crate::app::{App, Focus, LeftPage};
 use crate::config::{CommandsConfig, Island, JumpConfig, UiConfig};
+
+fn focus_border(focused: bool) -> Style {
+    if focused {
+        Style::new().fg(Color::Cyan)
+    } else {
+        Style::new().fg(Color::DarkGray)
+    }
+}
 
 pub fn terminal_pane_inner(area: Rect, config: &UiConfig) -> Rect {
     let [_, center, _] = Layout::horizontal([
@@ -30,8 +38,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     islands_column(f, right, app);
 }
 
-fn placeholder(f: &mut Frame, area: Rect, title: &str, text: &str) {
-    let block = Block::bordered().title(title);
+fn placeholder(f: &mut Frame, area: Rect, title: &str, text: &str, border: Style) {
+    let block = Block::bordered().border_style(border).title(title);
     f.render_widget(
         Paragraph::new(text)
             .alignment(Alignment::Center)
@@ -65,11 +73,12 @@ fn terminal_pane(f: &mut Frame, area: Rect, app: &App) {
         Line::from("")
     };
     let block = Block::bordered()
+        .border_style(focus_border(app.focus() == Focus::Terminal))
         .title("终端")
         .title_top(status.right_aligned())
         .title_bottom(
             Line::from(Span::styled(
-                "Ctrl+Q 退出 · F1 切页",
+                "Ctrl+Q 退出 · F2 岛栏 · F1 切页",
                 Style::new().fg(Color::DarkGray),
             ))
             .right_aligned(),
@@ -149,16 +158,19 @@ fn map_color(color: vt100::Color) -> Color {
 fn left_column(f: &mut Frame, area: Rect, app: &App) {
     let [dir, panel] =
         Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(area);
-    placeholder(f, dir, "目录", "M3 · 文件浏览");
-    paged_panel(f, panel, app);
+    let border = focus_border(false);
+    placeholder(f, dir, "目录", "M3 · 文件浏览", border);
+    paged_panel(f, panel, app, border);
 }
 
-fn paged_panel(f: &mut Frame, area: Rect, app: &App) {
+fn paged_panel(f: &mut Frame, area: Rect, app: &App, border: Style) {
     let text = match app.left_page {
         LeftPage::Jump => jump_page(&app.config.jump),
         LeftPage::Commands => commands_page(&app.config.commands),
     };
-    let block = Block::bordered().title(page_tabs(app.left_page));
+    let block = Block::bordered()
+        .border_style(border)
+        .title(page_tabs(app.left_page));
     f.render_widget(Paragraph::new(text).block(block), area);
 }
 
@@ -205,13 +217,18 @@ fn page_tabs(page: LeftPage) -> Line<'static> {
 }
 
 fn islands_column(f: &mut Frame, area: Rect, app: &App) {
-    let islands = &app.config.islands;
-    if islands.items.is_empty() {
-        placeholder(f, area, "岛", "未配置（参考 config.example.toml）");
+    if app.islands.is_empty() {
+        placeholder(
+            f,
+            area,
+            "岛",
+            "未配置（参考 config.example.toml）",
+            focus_border(false),
+        );
         return;
     }
-    let constraints: Vec<Constraint> = islands
-        .items
+    let constraints: Vec<Constraint> = app
+        .islands
         .iter()
         .map(|i| match i.height {
             Some(h) => Constraint::Length(h.max(3)),
@@ -219,12 +236,12 @@ fn islands_column(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     let areas = Layout::vertical(constraints).split(area);
-    for (island, &island_area) in islands.items.iter().zip(areas.iter()) {
-        render_island(f, island_area, island);
+    for (index, (island, &island_area)) in app.islands.iter().zip(areas.iter()).enumerate() {
+        render_island(f, island_area, island, app.focus() == Focus::Island(index));
     }
 }
 
-fn render_island(f: &mut Frame, area: Rect, island: &Island) {
+fn render_island(f: &mut Frame, area: Rect, island: &Island, focused: bool) {
     let title = island
         .name
         .clone()
@@ -235,6 +252,7 @@ fn render_island(f: &mut Frame, area: Rect, island: &Island) {
         ("○ 触发", Color::DarkGray)
     };
     let block = Block::bordered()
+        .border_style(focus_border(focused))
         .title(title)
         .title_top(Line::from(Span::styled(toggle, Style::new().fg(color))).right_aligned());
     let body = Paragraph::new(Span::styled(

@@ -8,7 +8,7 @@ use crossterm::event::{
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
-use crate::config::Config;
+use crate::config::{Config, Island};
 use crate::keys;
 use crate::pty;
 use crate::ui;
@@ -21,6 +21,12 @@ const COPY_NOTICE: Duration = Duration::from_secs(3);
 const LINE_SEP: &str = "\r\n";
 #[cfg(not(windows))]
 const LINE_SEP: &str = "\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Terminal,
+    Island(usize),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
@@ -71,11 +77,13 @@ pub struct App {
     pub left_page: LeftPage,
     pub pty: pty::PtySession,
     pub term: vt100::Parser,
+    pub islands: Vec<Island>,
     pty_size: (u16, u16),
     pane_inner: Rect,
     scroll: u16,
     selection: Option<Selection>,
     copy_notice: Option<(usize, Instant)>,
+    focus: Focus,
     should_quit: bool,
 }
 
@@ -85,6 +93,7 @@ impl App {
         let area = Rect::new(0, 0, width, height);
         let pane_inner = ui::terminal_pane_inner(area, &config.ui);
         let (rows, cols) = (pane_inner.height.max(1), pane_inner.width.max(1));
+        let islands = config.islands.items.clone();
         let pty = pty::PtySession::spawn(rows, cols)?;
         let term = vt100::Parser::new(rows, cols, SCROLLBACK_LEN);
         Ok(Self {
@@ -92,11 +101,13 @@ impl App {
             left_page: LeftPage::Jump,
             pty,
             term,
+            islands,
             pty_size: (rows, cols),
             pane_inner,
             scroll: 0,
             selection: None,
             copy_notice: None,
+            focus: Focus::Terminal,
             should_quit: false,
         })
     }
@@ -134,6 +145,10 @@ impl App {
 
     pub fn selection(&self) -> Option<Selection> {
         self.selection
+    }
+
+    pub fn focus(&self) -> Focus {
+        self.focus
     }
 
     pub fn selection_chars(&self) -> Option<usize> {
@@ -181,14 +196,31 @@ impl App {
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             self.should_quit = true;
-        } else if is_press
+        } else if is_press && key.code == KeyCode::F(1) {
+            self.left_page = self.left_page.next();
+        } else if is_press && key.code == KeyCode::F(2) {
+            self.cycle_focus();
+        } else {
+            match self.focus {
+                Focus::Terminal => self.handle_terminal_key(key, is_press, input),
+                Focus::Island(_) => {
+                    if is_press
+                        && matches!(key.code, KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc)
+                    {
+                        self.focus = Focus::Terminal;
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_terminal_key(&mut self, key: KeyEvent, is_press: bool, input: &mut Vec<u8>) {
+        if is_press
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && self.selection.is_some()
         {
             self.copy_selection();
-        } else if is_press && key.code == KeyCode::F(1) {
-            self.left_page = self.left_page.next();
         } else if is_press
             && key.code == KeyCode::End
             && key.modifiers.is_empty()
@@ -198,6 +230,18 @@ impl App {
         } else if let Some(bytes) = keys::encode(&key) {
             input.extend_from_slice(&bytes);
         }
+    }
+
+    fn cycle_focus(&mut self) {
+        let count = self.islands.len();
+        if count == 0 {
+            return;
+        }
+        self.focus = match self.focus {
+            Focus::Terminal => Focus::Island(0),
+            Focus::Island(i) if i + 1 < count => Focus::Island(i + 1),
+            Focus::Island(_) => Focus::Terminal,
+        };
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -389,6 +433,61 @@ mod tests {
         }
     }
 
+    fn app_with_islands() -> App {
+        let mut config = Config::default();
+        config.islands.items = vec![
+            Island {
+                name: None,
+                command: "a".to_owned(),
+                height: None,
+                live: false,
+            },
+            Island {
+                name: None,
+                command: "b".to_owned(),
+                height: None,
+                live: false,
+            },
+        ];
+        App::new(config).expect("app")
+    }
+
+    #[test]
+    fn f2_cycles_focus_through_islands() {
+        let mut app = app_with_islands();
+        let mut input = Vec::new();
+
+        assert_eq!(app.focus(), Focus::Terminal);
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Island(0));
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Island(1));
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Terminal);
+        assert!(input.is_empty());
+
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Terminal);
+    }
+
+    #[test]
+    fn f2_without_islands_stays_terminal() {
+        let mut app = App::new(Config::default()).expect("app");
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Terminal);
+    }
+
+    #[test]
+    fn terminal_focus_sends_tab_to_shell() {
+        let mut app = App::new(Config::default()).expect("app");
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Terminal);
+        assert_eq!(input, b"\t".to_vec());
+    }
+
     #[test]
     fn end_key_jumps_to_bottom_when_scrolled() {
         let mut app = App::new(Config::default()).expect("app");
@@ -472,7 +571,7 @@ mod tests {
         use crate::ui;
 
         for history in [0usize, 500, 2000, 5000] {
-            let mut app = App::new(Config::default()).expect("app");
+            let mut app = app_with_islands();
             app.term.screen_mut().set_size(28, 60);
             for i in 0..history {
                 app.term.process(format!("line {i}\r\n").as_bytes());

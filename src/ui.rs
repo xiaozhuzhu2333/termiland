@@ -71,6 +71,13 @@ pub fn paged_panel_rect(area: Rect, left_width: u16, right_width: u16) -> Rect {
     panel
 }
 
+pub fn dir_pane_rect(area: Rect, left_width: u16, right_width: u16) -> Rect {
+    let [left, _, _] = pane_areas(area, left_width, right_width);
+    let [dir, _] =
+        Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(left);
+    dir
+}
+
 pub fn island_layout(area: Rect, heights: &[Option<u16>]) -> Vec<Rect> {
     if heights.is_empty() {
         return Vec::new();
@@ -266,9 +273,152 @@ fn map_color(color: vt100::Color) -> Color {
 fn left_column(f: &mut Frame, area: Rect, app: &App) {
     let [dir, panel] =
         Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(area);
-    let border = focus_border(false);
-    placeholder(f, dir, "目录", "M3 · 文件浏览", border);
-    paged_panel(f, panel, app, border);
+    dir_pane(f, dir, app);
+    paged_panel(f, panel, app, focus_border(false));
+}
+
+fn dir_pane(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::bordered()
+        .border_style(focus_border(false))
+        .title("目录");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 2 || inner.height < 2 {
+        return;
+    }
+
+    let path_line = truncate_tail(&app.dir.path.to_string_lossy(), inner.width);
+    f.render_widget(
+        Paragraph::new(Span::styled(path_line, Style::new().fg(Color::DarkGray))),
+        Rect { height: 1, ..inner },
+    );
+
+    let list = Rect {
+        y: inner.y + 1,
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    if let Some(err) = &app.dir.error {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!("读取失败: {err}"),
+                Style::new().fg(Color::Red),
+            )),
+            list,
+        );
+        return;
+    }
+
+    let visible = list.height;
+    let total = app.dir.total();
+    if total == 0 {
+        f.render_widget(
+            Paragraph::new(Span::styled("空目录", Style::new().fg(Color::DarkGray)))
+                .alignment(Alignment::Center),
+            list,
+        );
+        return;
+    }
+    let offset = app.dir.clamped_offset(visible);
+    let show_bar = total > visible;
+    let text_width = inner.width - u16::from(show_bar);
+
+    for i in 0..visible {
+        let Some(entry) = app.dir.entries.get((offset + i) as usize) else {
+            break;
+        };
+        let label = truncate_entry(&entry.name, entry.is_dir, text_width);
+        let style = if entry.is_dir {
+            Style::new().fg(Color::Cyan)
+        } else if entry.hidden {
+            Style::new().fg(Color::DarkGray)
+        } else {
+            Style::new()
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(label, style)),
+            Rect {
+                y: list.y + i,
+                height: 1,
+                width: text_width,
+                ..list
+            },
+        );
+    }
+
+    if show_bar {
+        let bar_x = inner.x + inner.width - 1;
+        for y in list.y..list.y + list.height {
+            f.buffer_mut()[(bar_x, y)]
+                .set_symbol("│")
+                .set_style(Style::new().fg(Color::DarkGray));
+        }
+        let track = list.height;
+        let thumb_h = ((u32::from(track) * u32::from(visible)) / u32::from(total))
+            .max(1)
+            .min(u32::from(track)) as u16;
+        let max_off = total - visible;
+        let thumb_y = if max_off == 0 {
+            list.y
+        } else {
+            list.y + (u32::from(offset) * u32::from(track - thumb_h) / u32::from(max_off)) as u16
+        };
+        for dy in 0..thumb_h {
+            f.buffer_mut()[(bar_x, thumb_y + dy)]
+                .set_symbol("█")
+                .set_style(Style::new().fg(Color::Cyan));
+        }
+    }
+}
+
+fn truncate_entry(name: &str, is_dir: bool, width: u16) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let suffix = if is_dir { "/" } else { "" };
+    if display_width(name) + suffix.len() as u16 <= width {
+        return format!("{name}{suffix}");
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0u16;
+    for ch in name.chars() {
+        let cw = if ch.is_ascii() { 1 } else { 2 };
+        if used + cw > width - 1 {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    out
+}
+
+fn truncate_tail(text: &str, width: u16) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if display_width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    let mut tail = Vec::new();
+    let mut used = 0u16;
+    for ch in text.chars().rev() {
+        let cw = if ch.is_ascii() { 1 } else { 2 };
+        if used + cw > width - 1 {
+            break;
+        }
+        tail.push(ch);
+        used += cw;
+    }
+    tail.push('…');
+    tail.reverse();
+    tail.into_iter().collect()
 }
 
 fn paged_panel(f: &mut Frame, area: Rect, app: &App, border: Style) {

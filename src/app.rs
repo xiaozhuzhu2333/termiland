@@ -9,6 +9,7 @@ use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
 use crate::config::Config;
+use crate::dirpane::DirPane;
 use crate::island::{IslandState, sanitize_resize_boundary};
 use crate::keys;
 use crate::pty;
@@ -93,12 +94,14 @@ pub struct App {
     pub pty: pty::PtySession,
     pub term: vt100::Parser,
     pub islands: Vec<IslandState>,
+    pub dir: DirPane,
     pty_size: (u16, u16),
     pane_inner: Rect,
     layout_area: Rect,
     island_areas: Vec<Rect>,
     add_bar: Rect,
     paged_panel: Rect,
+    dir_pane_rect: Rect,
     scroll: u16,
     selection: Option<Selection>,
     notice: Option<(String, Instant, NoticeKind)>,
@@ -126,12 +129,16 @@ impl App {
             pty,
             term,
             islands: vec![IslandState::empty(10, 20)],
+            dir: DirPane::load(
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            ),
             pty_size: (rows, cols),
             pane_inner,
             layout_area: area,
             island_areas: Vec::new(),
             add_bar: Rect::default(),
             paged_panel: Rect::default(),
+            dir_pane_rect: Rect::default(),
             scroll: 0,
             selection: None,
             notice: None,
@@ -191,6 +198,7 @@ impl App {
         self.pane_inner = ui::terminal_pane_inner(area, left, right);
         self.relayout_islands(area, left, right);
         self.paged_panel = ui::paged_panel_rect(area, left, right);
+        self.dir_pane_rect = ui::dir_pane_rect(area, left, right);
         let size = (self.pane_inner.height.max(1), self.pane_inner.width.max(1));
         if self.pty_size != size {
             self.pty_size = size;
@@ -533,9 +541,16 @@ impl App {
     fn scroll_mouse(&mut self, delta: i32, column: u16, row: u16) {
         if let Some((index, _)) = self.island_hit(column, row) {
             self.islands[index].scroll_by(delta);
+        } else if self.in_dir_pane(column, row) {
+            self.dir.scroll_by(delta);
         } else {
             self.scroll_by(delta);
         }
+    }
+
+    fn in_dir_pane(&self, column: u16, row: u16) -> bool {
+        let r = self.dir_pane_rect;
+        column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
     }
 
     fn clear_all_selections(&mut self) {
@@ -1042,7 +1057,7 @@ mod tests {
 
         let outside = MouseEvent {
             kind: MouseEventKind::ScrollUp,
-            column: 10,
+            column: 30,
             row: 5,
             modifiers: KeyModifiers::NONE,
         };
@@ -1320,6 +1335,41 @@ mod tests {
         crate::island::sanitize_resize_boundary(&mut parser, 10);
         crate::island::sanitize_resize_boundary(&mut parser, 12);
         assert_eq!(parser.screen().contents(), before, "不收窄时净化应为无操作");
+    }
+
+    #[test]
+    fn wheel_over_dir_pane_scrolls_it() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.dir.entries = (0..100)
+            .map(|i| crate::dirpane::Entry {
+                name: format!("f{i}"),
+                is_dir: false,
+                hidden: false,
+            })
+            .collect();
+        app.dir_pane_rect = Rect::new(0, 0, 22, 15);
+        for i in 0..100 {
+            app.term.process(format!("tline{i}\r\n").as_bytes());
+        }
+
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel).unwrap();
+        assert!(app.dir.offset > 0, "目录栏应滚动");
+        assert_eq!(app.scroll(), 0, "主终端不应被影响");
+
+        let outside = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 30,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(outside).unwrap();
+        assert!(app.scroll() > 0, "目录栏外滚动应作用于主终端");
     }
 
     #[test]

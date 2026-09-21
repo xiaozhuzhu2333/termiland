@@ -1,4 +1,5 @@
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -19,6 +20,7 @@ const SCROLLBACK_LEN: usize = 10_000;
 const SCROLL_STEP: i32 = 3;
 const NOTICE: Duration = Duration::from_secs(3);
 const TRIGGER_SETTLE: Duration = Duration::from_millis(300);
+const DIR_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[cfg(windows)]
 const LINE_SEP: &str = "\r\n";
@@ -108,6 +110,8 @@ pub struct App {
     focus: Focus,
     trigger_pending: bool,
     last_output_at: Instant,
+    last_dir_poll: Instant,
+    dir_mtime: Option<SystemTime>,
     should_quit: bool,
 }
 
@@ -145,6 +149,8 @@ impl App {
             focus: Focus::Terminal,
             trigger_pending: false,
             last_output_at: Instant::now(),
+            last_dir_poll: Instant::now(),
+            dir_mtime: None,
             should_quit: false,
         };
         app.refresh_layout(area)?;
@@ -165,6 +171,7 @@ impl App {
                 island.poll_output();
             }
             self.maybe_trigger_live();
+            self.poll_dir_pane();
             terminal.draw(|f| ui::draw(f, self))?;
             self.handle_events()?;
         }
@@ -181,6 +188,36 @@ impl App {
                 island.execute();
             }
         }
+    }
+
+    fn poll_dir_pane(&mut self) {
+        if self.last_dir_poll.elapsed() < DIR_POLL_INTERVAL {
+            return;
+        }
+        self.last_dir_poll = Instant::now();
+        if let Some(cwd) = self.shell_cwd()
+            && cwd != self.dir.path
+        {
+            self.dir = DirPane::load(cwd);
+            self.dir_mtime = dir_mtime(&self.dir.path);
+            return;
+        }
+        let mtime = dir_mtime(&self.dir.path);
+        if mtime.is_some() && mtime != self.dir_mtime {
+            self.dir_mtime = mtime;
+            self.dir.reload();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn shell_cwd(&self) -> Option<PathBuf> {
+        let pid = self.pty.child_pid()?;
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn shell_cwd(&self) -> Option<PathBuf> {
+        None
     }
 
     fn sync_layout(&mut self, terminal: &DefaultTerminal) -> Result<()> {
@@ -678,6 +715,10 @@ fn selection_text(term: &vt100::Parser, sel: &Selection) -> String {
         }
     }
     out
+}
+
+fn dir_mtime(path: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 #[cfg(test)]
@@ -1370,6 +1411,53 @@ mod tests {
         };
         app.handle_mouse(outside).unwrap();
         assert!(app.scroll() > 0, "目录栏外滚动应作用于主终端");
+    }
+
+    #[test]
+    fn dir_pane_refreshes_on_mtime_change() {
+        let base = std::env::temp_dir().join(format!("termiland-mtime-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut app = App::new(Config::default()).expect("app");
+        app.dir = crate::dirpane::DirPane::load(base.clone());
+        app.dir_mtime = None;
+
+        app.last_dir_poll = Instant::now() - DIR_POLL_INTERVAL;
+        app.poll_dir_pane();
+        assert!(
+            !app.dir.entries.iter().any(|e| e.name == "new_file.txt"),
+            "初始目录为空"
+        );
+
+        std::fs::File::create(base.join("new_file.txt")).unwrap();
+        app.last_dir_poll = Instant::now() - DIR_POLL_INTERVAL;
+        app.poll_dir_pane();
+        assert!(
+            app.dir.entries.iter().any(|e| e.name == "new_file.txt"),
+            "目录内容变化后应自动刷新"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dir_pane_follows_shell_cwd() {
+        let mut app = App::new(Config::default()).expect("app");
+        let initial = app.dir.path.clone();
+
+        app.send_terminal_input(b"cd /tmp\r").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.dir.path == initial && std::time::Instant::now() < deadline {
+            let _ = app.pty.poll_output();
+            app.last_dir_poll = Instant::now() - DIR_POLL_INTERVAL;
+            app.poll_dir_pane();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            app.dir.path.ends_with("tmp"),
+            "目录栏应跟随 shell 的 cwd: {:?}",
+            app.dir.path
+        );
     }
 
     #[test]

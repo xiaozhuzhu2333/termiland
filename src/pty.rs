@@ -13,6 +13,8 @@ pub struct PtySession {
     writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
     cursor: Arc<Mutex<(u16, u16)>>,
     child: Box<dyn Child + Send + Sync>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    child_pid: Option<u32>,
     reader_thread: Option<JoinHandle<()>>,
     output: Receiver<Vec<u8>>,
     alive: bool,
@@ -73,12 +75,18 @@ impl PtySession {
             master: Some(pair.master),
             writer: Some(writer),
             cursor,
+            child_pid: child.process_id(),
             child,
             reader_thread: Some(reader_thread),
             output: rx,
             alive: true,
             finished: false,
         })
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child_pid
     }
 
     pub fn poll_output(&mut self) -> Vec<u8> {
@@ -281,6 +289,10 @@ mod tests {
         cmd.arg("echo termiland-pty-ok");
 
         let mut session = PtySession::spawn_command(cmd, 24, 80).expect("spawn");
+        assert!(
+            session.child_pid().is_some_and(|pid| pid > 0),
+            "应暴露子进程 pid"
+        );
         let mut all = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !session.is_finished() && std::time::Instant::now() < deadline {

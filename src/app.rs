@@ -229,6 +229,10 @@ impl App {
                         && matches!(key.code, KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc)
                     {
                         self.focus = Focus::Terminal;
+                    } else if is_press && key.code == KeyCode::Up {
+                        self.move_island_focus(-1);
+                    } else if is_press && key.code == KeyCode::Down {
+                        self.move_island_focus(1);
                     }
                 }
             }
@@ -263,6 +267,14 @@ impl App {
             Focus::Island(i) if i + 1 < count => Focus::Island(i + 1),
             Focus::Island(_) => Focus::Terminal,
         };
+    }
+
+    fn move_island_focus(&mut self, delta: i32) {
+        if let Focus::Island(i) = self.focus {
+            let count = self.islands.len() as i32;
+            let target = (i as i32 + delta).clamp(0, count - 1);
+            self.focus = Focus::Island(target as usize);
+        }
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -592,6 +604,35 @@ mod tests {
         app.handle_mouse(click);
         assert_eq!(app.focus(), Focus::Terminal);
         assert!(app.selection.is_some());
+    }
+
+    #[test]
+    fn island_focus_navigates_with_arrows() {
+        let mut app = app_with_islands();
+        let mut input = Vec::new();
+
+        app.handle_key(press_key(KeyCode::F(2), KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Island(0));
+
+        app.handle_key(press_key(KeyCode::Up, KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Island(0), "顶部应钳位");
+
+        app.handle_key(press_key(KeyCode::Down, KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Island(1));
+        app.handle_key(press_key(KeyCode::Down, KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Island(1), "底部应钳位");
+
+        app.handle_key(press_key(KeyCode::Up, KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Island(0));
+
+        app.handle_key(
+            press_key(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut input,
+        );
+        assert!(input.is_empty(), "岛聚焦时按键不应进入 shell");
+
+        app.handle_key(press_key(KeyCode::Esc, KeyModifiers::NONE), &mut input);
+        assert_eq!(app.focus(), Focus::Terminal);
     }
 
     #[test]

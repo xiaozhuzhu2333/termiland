@@ -308,6 +308,17 @@ fn render_island(f: &mut Frame, area: Rect, island: &Island, focused: bool) {
         .border_style(focus_border(focused))
         .title(title)
         .title_top(Line::from(Span::styled(toggle, Style::new().fg(color))).right_aligned());
+    let block = if focused {
+        block.title_bottom(
+            Line::from(Span::styled(
+                "↑↓ 切换 · Esc 返回",
+                Style::new().fg(Color::DarkGray),
+            ))
+            .right_aligned(),
+        )
+    } else {
+        block
+    };
     let body = Paragraph::new(Span::styled(
         format!("M4 · {}", island.command),
         Style::new().fg(Color::DarkGray),

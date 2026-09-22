@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::app::{App, DirSelection, Focus, LeftPage, NoticeKind, Selection};
-use crate::config::{CommandsConfig, JumpConfig, UiConfig};
+use crate::config::UiConfig;
 use crate::island::IslandState;
 
 fn focus_border(focused: bool) -> Style {
@@ -37,6 +37,43 @@ pub fn paged_tab_hit(panel: Rect, column: u16, row: u16) -> Option<LeftPage> {
             });
         }
         x += width + 1;
+    }
+    None
+}
+
+pub fn paged_add_zone(panel: Rect) -> (u16, u16) {
+    (panel.x + panel.width - 4, panel.y)
+}
+
+pub fn paged_add_hit(panel: Rect, column: u16, row: u16) -> bool {
+    if panel.width < 16 {
+        return false;
+    }
+    let (x, y) = paged_add_zone(panel);
+    row == y && column >= x && column < x + 3
+}
+
+pub fn paged_record_hit(
+    panel: Rect,
+    column: u16,
+    row: u16,
+    records_len: usize,
+    offset: u16,
+    input_active: bool,
+) -> Option<(usize, bool)> {
+    let view = paged_records_view(panel, input_active, records_len);
+    if row >= view.area.y
+        && row < view.area.y + view.area.height
+        && column >= view.area.x
+        && column < view.area.x + view.area.width
+    {
+        if view.show_bar(records_len) && column == view.area.x + view.area.width - 1 {
+            return None;
+        }
+        let index = offset as usize + (row - view.area.y) as usize;
+        if index < records_len {
+            return Some((index, column - view.area.x <= 1));
+        }
     }
     None
 }
@@ -196,7 +233,7 @@ fn terminal_pane(f: &mut Frame, area: Rect, app: &App) {
         .title_top(status.right_aligned())
         .title_bottom(
             Line::from(Span::styled(
-                "Ctrl+Q 退出 · F2 岛栏 · F1 切页",
+                "Ctrl+Q 退出 · F2 岛栏 · F1 切页 · Ctrl+I 收藏",
                 Style::new().fg(Color::DarkGray),
             ))
             .right_aligned(),
@@ -370,7 +407,7 @@ fn dir_pane(f: &mut Frame, area: Rect, app: &App) {
         };
         for dy in 0..thumb_h {
             f.buffer_mut()[(bar_x, thumb_y + dy)]
-                .set_symbol("█")
+                .set_symbol("▐")
                 .set_style(Style::new().fg(Color::Cyan));
         }
     }
@@ -411,20 +448,19 @@ fn reverse_row(f: &mut Frame, inner: Rect, row: u16, lines: &[(String, Style)]) 
     }
 }
 
-fn truncate_entry(name: &str, is_dir: bool, width: u16) -> String {
+fn truncate_head(text: &str, width: u16) -> String {
     if width == 0 {
         return String::new();
     }
-    let suffix = if is_dir { "/" } else { "" };
-    if display_width(name) + suffix.len() as u16 <= width {
-        return format!("{name}{suffix}");
+    if display_width(text) <= width {
+        return text.to_owned();
     }
     if width == 1 {
         return "…".to_owned();
     }
     let mut out = String::new();
     let mut used = 0u16;
-    for ch in name.chars() {
+    for ch in text.chars() {
         let cw = if ch.is_ascii() { 1 } else { 2 };
         if used + cw > width - 1 {
             break;
@@ -434,6 +470,54 @@ fn truncate_entry(name: &str, is_dir: bool, width: u16) -> String {
     }
     out.push('…');
     out
+}
+
+fn truncate_middle(text: &str, width: u16) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if display_width(text) <= width {
+        return text.to_owned();
+    }
+    if width < 5 {
+        return truncate_head(text, width);
+    }
+    let budget = width - 1;
+    let head_budget = budget * 2 / 3;
+    let tail_budget = budget - head_budget;
+    let mut head = String::new();
+    let mut used = 0u16;
+    for ch in text.chars() {
+        let cw = if ch.is_ascii() { 1 } else { 2 };
+        if used + cw > head_budget {
+            break;
+        }
+        head.push(ch);
+        used += cw;
+    }
+    let mut tail = Vec::new();
+    let mut used = 0u16;
+    for ch in text.chars().rev() {
+        let cw = if ch.is_ascii() { 1 } else { 2 };
+        if used + cw > tail_budget {
+            break;
+        }
+        tail.push(ch);
+        used += cw;
+    }
+    tail.reverse();
+    format!("{head}…{}", tail.into_iter().collect::<String>())
+}
+
+fn truncate_entry(name: &str, is_dir: bool, width: u16) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let suffix = if is_dir { "/" } else { "" };
+    if display_width(name) + suffix.len() as u16 <= width {
+        return format!("{name}{suffix}");
+    }
+    truncate_head(name, width)
 }
 
 fn truncate_tail(text: &str, width: u16) -> String {
@@ -461,43 +545,166 @@ fn truncate_tail(text: &str, width: u16) -> String {
     tail.into_iter().collect()
 }
 
-fn paged_panel(f: &mut Frame, area: Rect, app: &App, border: Style) {
-    let text = match app.left_page {
-        LeftPage::Jump => jump_page(&app.config.jump),
-        LeftPage::Commands => commands_page(&app.config.commands),
+pub struct PagedRecordsView {
+    pub area: Rect,
+    pub text_width: u16,
+}
+
+impl PagedRecordsView {
+    pub fn visible(&self) -> u16 {
+        self.area.height
+    }
+
+    pub fn show_bar(&self, records_len: usize) -> bool {
+        records_len > self.area.height as usize
+    }
+}
+
+pub fn paged_records_view(panel: Rect, input_active: bool, records_len: usize) -> PagedRecordsView {
+    let inner = bordered_inner(panel);
+    let area = Rect {
+        height: inner.height.saturating_sub(u16::from(input_active)),
+        ..inner
     };
+    let view = PagedRecordsView {
+        area,
+        text_width: 0,
+    };
+    let show_bar = view.show_bar(records_len);
+    PagedRecordsView {
+        area,
+        text_width: area.width.saturating_sub(2 + u16::from(show_bar)),
+    }
+}
+
+pub fn clamp_record_offset(offset: u16, records_len: usize, visible: u16) -> u16 {
+    let max = records_len
+        .saturating_sub(visible as usize)
+        .min(u16::MAX as usize);
+    offset.min(max as u16)
+}
+
+fn paged_panel(f: &mut Frame, area: Rect, app: &App, border: Style) {
     let block = Block::bordered()
         .border_style(border)
         .title(page_tabs(app.left_page));
-    f.render_widget(Paragraph::new(text).block(block), area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 2 || inner.height < 1 {
+        return;
+    }
+    let records_len = app.paged_records_len();
+    let input_active = app.panel_input().is_some();
+    let view = paged_records_view(area, input_active, records_len);
+    let offset = clamp_record_offset(app.panel_offset(), records_len, view.visible());
+    f.render_widget(
+        Paragraph::new(Text::from(paged_panel_lines(app, offset, &view))),
+        view.area,
+    );
+
+    if view.show_bar(records_len) {
+        let bar_x = view.area.x + view.area.width - 1;
+        let track = view.area.height;
+        for y in view.area.y..view.area.y + track {
+            f.buffer_mut()[(bar_x, y)]
+                .set_symbol("│")
+                .set_style(Style::new().fg(Color::DarkGray));
+        }
+        let total = records_len.min(u16::MAX as usize) as u16;
+        let thumb_h = ((u32::from(track) * u32::from(track)) / u32::from(total))
+            .max(1)
+            .min(u32::from(track)) as u16;
+        let max_off = total - track;
+        let thumb_y = if max_off == 0 {
+            view.area.y
+        } else {
+            view.area.y
+                + (u32::from(offset) * u32::from(track - thumb_h) / u32::from(max_off)) as u16
+        };
+        for dy in 0..thumb_h {
+            f.buffer_mut()[(bar_x, thumb_y + dy)]
+                .set_symbol("▐")
+                .set_style(Style::new().fg(Color::Cyan));
+        }
+    }
+
+    if let Some(text) = app.panel_input() {
+        let y = inner.y + inner.height - 1;
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("> ", Style::new().fg(Color::Cyan)),
+                Span::raw(text.to_owned()),
+                Span::styled("▎", Style::new().fg(Color::Cyan)),
+            ])),
+            Rect {
+                y,
+                height: 1,
+                ..inner
+            },
+        );
+    }
+
+    if area.width >= 16 {
+        let (x, y) = paged_add_zone(area);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "[+]",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )),
+            Rect {
+                x,
+                y,
+                width: 3,
+                height: 1,
+            },
+        );
+    }
 }
 
-fn jump_page(jump: &JumpConfig) -> Text<'static> {
-    if jump.bookmarks.is_empty() {
-        return Text::from("未配置收藏目录（[jump].bookmarks）");
-    }
-    Text::from(
-        jump.bookmarks
-            .iter()
-            .map(|b| Line::from(format!("→ {b}")))
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn commands_page(commands: &CommandsConfig) -> Text<'static> {
-    if commands.items.is_empty() {
-        return Text::from("未配置常用命令（[[commands.items]]）");
-    }
-    Text::from(
-        commands
+fn paged_panel_lines(app: &App, offset: u16, view: &PagedRecordsView) -> Vec<Line<'static>> {
+    let records: Vec<String> = match app.left_page {
+        LeftPage::Jump => app.config.jump.bookmarks.clone(),
+        LeftPage::Commands => app
+            .config
+            .commands
             .items
             .iter()
-            .map(|c| {
-                let name = c.name.as_deref().unwrap_or(c.command.as_str());
-                Line::from(format!("{name} · {}", c.command))
+            .map(|c| match &c.name {
+                Some(name) => format!("{name} · {}", c.command),
+                None => c.command.clone(),
             })
-            .collect::<Vec<_>>(),
-    )
+            .collect(),
+    };
+    if records.is_empty() {
+        let hint = match app.left_page {
+            LeftPage::Jump => "Ctrl+I 添加当前路径",
+            LeftPage::Commands => "Ctrl+I 添加当前命令",
+        };
+        return vec![Line::from(Span::styled(
+            hint,
+            Style::new().fg(Color::DarkGray),
+        ))];
+    }
+    records
+        .into_iter()
+        .enumerate()
+        .skip(offset as usize)
+        .take(view.visible() as usize)
+        .map(|(index, text)| {
+            let (marker, marker_style) = if app.armed_record() == Some(index) {
+                (
+                    "× ",
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("→ ", Style::new().fg(Color::DarkGray))
+            };
+            Line::from(vec![
+                Span::styled(marker, marker_style),
+                Span::raw(truncate_middle(&text, view.text_width)),
+            ])
+        })
+        .collect()
 }
 
 fn page_tabs(page: LeftPage) -> Line<'static> {
@@ -620,6 +827,75 @@ mod tests {
     }
 
     #[test]
+    fn paged_add_hit_matches_zone() {
+        let panel = Rect::new(0, 5, 22, 10);
+        assert!(paged_add_hit(panel, 18, 5));
+        assert!(paged_add_hit(panel, 20, 5));
+        assert!(!paged_add_hit(panel, 17, 5));
+        assert!(!paged_add_hit(panel, 21, 5));
+        assert!(!paged_add_hit(panel, 18, 6));
+        assert!(
+            !paged_add_hit(Rect::new(0, 5, 12, 10), 8, 5),
+            "窄面板不显示 [+]"
+        );
+    }
+
+    #[test]
+    fn paged_record_hit_maps_rows_and_arrow_zone() {
+        let panel = Rect::new(0, 5, 22, 10);
+        assert_eq!(paged_record_hit(panel, 1, 6, 3, 0, false), Some((0, true)));
+        assert_eq!(paged_record_hit(panel, 2, 6, 3, 0, false), Some((0, true)));
+        assert_eq!(paged_record_hit(panel, 3, 6, 3, 0, false), Some((0, false)));
+        assert_eq!(paged_record_hit(panel, 5, 7, 3, 0, false), Some((1, false)));
+        assert_eq!(paged_record_hit(panel, 1, 8, 3, 0, false), Some((2, true)));
+        assert_eq!(
+            paged_record_hit(panel, 1, 9, 3, 0, false),
+            None,
+            "超出条目数的行不可命中"
+        );
+        assert_eq!(
+            paged_record_hit(panel, 1, 6, 3, 2, false),
+            Some((2, true)),
+            "偏移后首行对应绝对索引 2"
+        );
+        assert_eq!(
+            paged_record_hit(panel, 3, 13, 10, 0, false),
+            Some((7, false)),
+            "可见区最后一行可命中"
+        );
+        assert_eq!(
+            paged_record_hit(panel, 1, 14, 10, 0, false),
+            None,
+            "超出可见高度的行不可命中"
+        );
+        assert_eq!(
+            paged_record_hit(panel, 1, 13, 10, 0, true),
+            None,
+            "输入栏占用最底行时该行不可命中"
+        );
+        assert_eq!(
+            paged_record_hit(panel, 1, 12, 10, 0, true),
+            Some((6, true)),
+            "输入栏打开时倒数第二行仍可命中"
+        );
+        assert_eq!(
+            paged_record_hit(panel, 20, 6, 10, 0, false),
+            None,
+            "滚动条所在列不可命中"
+        );
+        assert_eq!(
+            paged_record_hit(panel, 3, 6, 10, 0, false),
+            Some((0, false)),
+            "滚动条之外的列正常命中"
+        );
+        assert_eq!(
+            paged_record_hit(panel, 1, 5, 3, 0, false),
+            None,
+            "边框行不是条目"
+        );
+    }
+
+    #[test]
     fn maps_vt100_colors_to_ratatui() {
         assert_eq!(map_color(vt100::Color::Default), Color::Reset);
         assert_eq!(map_color(vt100::Color::Idx(4)), Color::Indexed(4));
@@ -660,6 +936,24 @@ mod tests {
     }
 
     #[test]
+    fn paged_panel_lines_truncates_long_records() {
+        use crate::app::App;
+        use crate::config::Config;
+
+        let mut app = App::new(Config::default()).expect("app");
+        app.config.jump.bookmarks =
+            vec!["/very/long/directory/name/that/cannot/fit/in/pane".to_owned()];
+
+        let view = paged_records_view(Rect::new(0, 0, 22, 12), false, 1);
+        let lines = paged_panel_lines(&app, 0, &view);
+        let text = lines[0].spans[1].content.to_string();
+        assert_eq!(
+            text, "/very/long/…n/pane",
+            "中段截断应同时保留头尾，便于区分前缀相同的长记录"
+        );
+    }
+
+    #[test]
     fn full_draw_keeps_cells_complete() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -675,6 +969,7 @@ mod tests {
             islands: IslandsConfig { max: 3 },
             jump: JumpConfig::default(),
             commands: CommandsConfig::default(),
+            save_path: None,
         };
 
         let mut app = App::new(config).expect("app");

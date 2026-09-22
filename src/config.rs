@@ -1,17 +1,19 @@
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub ui: UiConfig,
     pub islands: IslandsConfig,
     pub jump: JumpConfig,
     pub commands: CommandsConfig,
+    #[serde(skip)]
+    pub save_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
     pub left_width: u16,
@@ -27,7 +29,7 @@ impl Default for UiConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IslandsConfig {
     pub max: usize,
@@ -39,21 +41,22 @@ impl Default for IslandsConfig {
     }
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JumpConfig {
     pub bookmarks: Vec<String>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommandsConfig {
     pub items: Vec<CommandItem>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub command: String,
 }
@@ -67,7 +70,10 @@ impl Config {
                 if path.exists() {
                     Self::from_file(&path)
                 } else {
-                    Ok(Self::default())
+                    Ok(Config {
+                        save_path: Some(path),
+                        ..Config::default()
+                    })
                 }
             }
         }
@@ -76,7 +82,23 @@ impl Config {
     fn from_file(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("读取配置失败 {path:?}: {e}"))?;
-        toml::from_str(&raw).map_err(|e| anyhow::anyhow!("解析配置失败 {path:?}: {e}"))
+        let mut config: Config =
+            toml::from_str(&raw).map_err(|e| anyhow::anyhow!("解析配置失败 {path:?}: {e}"))?;
+        config.save_path = Some(path.to_path_buf());
+        Ok(config)
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        let Some(path) = &self.save_path else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("创建配置目录失败 {path:?}: {e}"))?;
+        }
+        let raw = toml::to_string_pretty(self)?;
+        std::fs::write(path, raw).map_err(|e| anyhow::anyhow!("写入配置失败 {path:?}: {e}"))?;
+        Ok(())
     }
 }
 
@@ -129,10 +151,56 @@ command = "df -h"
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.ui.left_width, 30);
+        assert_eq!(cfg.ui.right_width, 50);
         assert_eq!(cfg.islands.max, 2);
         assert_eq!(cfg.jump.bookmarks, ["/var/log", "/data"]);
         assert_eq!(cfg.commands.items.len(), 2);
         assert!(cfg.commands.items[0].name.is_some());
         assert!(cfg.commands.items[1].name.is_none());
+    }
+
+    #[test]
+    fn save_round_trips_through_file() {
+        let path = std::env::temp_dir().join(format!("termiland-cfg-{}.toml", std::process::id()));
+        let config = Config {
+            save_path: Some(path.clone()),
+            jump: JumpConfig {
+                bookmarks: vec!["/var/log".to_owned(), "/data".to_owned()],
+            },
+            commands: CommandsConfig {
+                items: vec![
+                    CommandItem {
+                        name: Some("服务状态".to_owned()),
+                        command: "systemctl status nginx".to_owned(),
+                    },
+                    CommandItem {
+                        name: None,
+                        command: "df -h".to_owned(),
+                    },
+                ],
+            },
+            ..Config::default()
+        };
+        config.save().unwrap();
+
+        let reloaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(reloaded.jump.bookmarks, config.jump.bookmarks);
+        assert_eq!(reloaded.commands.items, config.commands.items);
+        assert_eq!(reloaded.save_path, Some(path.clone()));
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("name = \"df"),
+            "name 为 None 时不应序列化 name 字段"
+        );
+        assert!(!raw.contains("save_path"), "save_path 不应写入文件");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn save_without_path_is_noop() {
+        let config = Config::default();
+        assert!(config.save().is_ok());
     }
 }

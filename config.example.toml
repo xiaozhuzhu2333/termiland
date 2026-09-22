@@ -1,24 +1,41 @@
-# 复制到 ~/.config/termiland/config.toml 后按需修改，所有字段均可省略
-
 [ui]
-left_width = 22   # 左栏宽度（列）
-right_width = 36  # 右栏宽度（列）
+left_width = 22
+right_width = 36
 
 [islands]
-max = 3  # 岛数量上限；岛的命令在运行时输入，无需配置
-
-# 岛使用方式：F2 聚焦岛 → 输入命令 → 回车执行
-#   ◉ 跟随：中栏每执行完一条命令，岛自动重新执行一次（适合 df / history 类快照命令）
-#   ○ 单次：执行一次，输出持续显示（适合 top / ping -t / tail -f 类持续输出命令）
-# 点击岛右上角徽标可切换模式
+max = 3
 
 [jump]
-bookmarks = ["/var/log", "/etc/nginx", "/data"]  # 左下「跳转」页：收藏目录
-
-[[commands.items]]  # 左下「命令」页：常用命令，选中后发送到中栏执行
-name = "服务状态"
-command = "systemctl status nginx"
+bookmarks = [
+    "/var/log",
+    "/etc/nginx",
+    "/data",
+    'C:\termiland',
+]
 
 [[commands.items]]
-name = "磁盘"
-command = "df -h"
+command = "cls"
+
+[[commands.items]]
+command = "clss"
+
+[[commands.items]]
+command = "q"
+
+[[commands.items]]
+command = "qwe"
+
+[[commands.items]]
+command = "qwrrwq"
+
+[[commands.items]]
+command = "time /t"
+
+[[commands.items]]
+command = "echo time"
+
+[[commands.items]]
+command = "echo t"
+
+[[commands.items]]
+command = "echo ppp"

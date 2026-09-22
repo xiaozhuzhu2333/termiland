@@ -9,7 +9,7 @@ use crossterm::event::{
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 
-use crate::config::Config;
+use crate::config::{CommandItem, Config};
 use crate::dirpane::DirPane;
 use crate::island::{IslandState, sanitize_resize_boundary};
 use crate::keys;
@@ -117,6 +117,9 @@ pub struct App {
     dir_selection: Option<DirSelection>,
     notice: Option<(String, Instant, NoticeKind)>,
     focus: Focus,
+    armed_record: Option<usize>,
+    panel_input: Option<String>,
+    panel_offset: u16,
     trigger_pending: bool,
     last_output_at: Instant,
     last_dir_poll: Instant,
@@ -157,6 +160,9 @@ impl App {
             dir_selection: None,
             notice: None,
             focus: Focus::Terminal,
+            armed_record: None,
+            panel_input: None,
+            panel_offset: 0,
             trigger_pending: false,
             last_output_at: Instant::now(),
             last_dir_poll: Instant::now(),
@@ -338,6 +344,25 @@ impl App {
         self.focus
     }
 
+    pub fn armed_record(&self) -> Option<usize> {
+        self.armed_record
+    }
+
+    pub fn panel_input(&self) -> Option<&str> {
+        self.panel_input.as_deref()
+    }
+
+    pub fn panel_offset(&self) -> u16 {
+        self.panel_offset
+    }
+
+    pub fn paged_records_len(&self) -> usize {
+        match self.left_page {
+            LeftPage::Jump => self.config.jump.bookmarks.len(),
+            LeftPage::Commands => self.config.commands.items.len(),
+        }
+    }
+
     pub fn selection_chars(&self) -> Option<usize> {
         self.selection
             .map(|sel| selection_text(&self.term, &sel).chars().count())
@@ -357,14 +382,24 @@ impl App {
         loop {
             match event::read()? {
                 Event::Key(key) => self.handle_key(key, &mut input)?,
-                Event::Paste(text) => match self.focus {
-                    Focus::Island(_) => {
+                Event::Paste(text) => {
+                    if self.panel_input.is_some() {
                         let line: String =
                             text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
-                        self.edit_focused_command(Some(&line));
+                        if let Some(buffer) = &mut self.panel_input {
+                            buffer.push_str(&line);
+                        }
+                    } else {
+                        match self.focus {
+                            Focus::Island(_) => {
+                                let line: String =
+                                    text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+                                self.edit_focused_command(Some(&line));
+                            }
+                            Focus::Terminal => input.extend_from_slice(&keys::paste_bytes(&text)),
+                        }
                     }
-                    Focus::Terminal => input.extend_from_slice(&keys::paste_bytes(&text)),
-                },
+                }
                 Event::Mouse(mouse) => self.handle_mouse(mouse)?,
                 _ => {}
             }
@@ -393,6 +428,10 @@ impl App {
             return Ok(());
         }
         let is_press = key.kind == KeyEventKind::Press;
+        if is_press && self.panel_input.is_some() {
+            self.handle_panel_input_key(key);
+            return Ok(());
+        }
         if is_press
             && key.code == KeyCode::Char('q')
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -400,10 +439,17 @@ impl App {
             self.should_quit = true;
         } else if is_press && key.code == KeyCode::F(1) {
             self.left_page = self.left_page.next();
+            self.armed_record = None;
+            self.panel_offset = 0;
         } else if is_press && key.code == KeyCode::F(2) {
             self.cycle_focus();
         } else if is_press && key.code == KeyCode::F(3) {
             self.add_island()?;
+        } else if is_press
+            && key.modifiers == KeyModifiers::CONTROL
+            && (key.code == KeyCode::Tab || key.code == KeyCode::Char('i'))
+        {
+            self.add_panel_record()?;
         } else if is_press
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -554,11 +600,157 @@ impl App {
         }
     }
 
+    fn panel_input_row_hit(&self, column: u16, row: u16) -> bool {
+        let inner = ui::bordered_inner(self.paged_panel);
+        inner.height > 0
+            && row == inner.y + inner.height - 1
+            && column >= inner.x
+            && column < inner.x + inner.width
+    }
+
+    fn handle_panel_input_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+        } else if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+            self.confirm_panel_input();
+        } else if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            self.panel_input = None;
+        } else if key.code == KeyCode::Backspace && key.modifiers.is_empty() {
+            if let Some(text) = &mut self.panel_input {
+                text.pop();
+            }
+        } else if let KeyCode::Char(c) = key.code
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+            && let Some(text) = &mut self.panel_input
+        {
+            text.push(c);
+        }
+    }
+
+    fn confirm_panel_input(&mut self) {
+        let Some(raw) = self.panel_input.take() else {
+            return;
+        };
+        let text = raw.trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        self.push_panel_record(text);
+    }
+
+    fn push_panel_record(&mut self, text: String) {
+        let duplicate = match self.left_page {
+            LeftPage::Jump => self.config.jump.bookmarks.contains(&text),
+            LeftPage::Commands => self.config.commands.items.iter().any(|c| c.command == text),
+        };
+        if duplicate {
+            self.notify("已存在，未重复添加".to_owned(), NoticeKind::Warn);
+            return;
+        }
+        self.notify(format!("已添加 {text}"), NoticeKind::Info);
+        match self.left_page {
+            LeftPage::Jump => self.config.jump.bookmarks.push(text),
+            LeftPage::Commands => self.config.commands.items.push(CommandItem {
+                name: None,
+                command: text,
+            }),
+        }
+        let len = self.paged_records_len();
+        let view = ui::paged_records_view(self.paged_panel, false, len);
+        self.panel_offset = ui::clamp_record_offset(u16::MAX, len, view.visible());
+        self.save_config();
+    }
+
+    fn panel_record_text(&self, index: usize) -> Option<String> {
+        match self.left_page {
+            LeftPage::Jump => self.config.jump.bookmarks.get(index).cloned(),
+            LeftPage::Commands => self
+                .config
+                .commands
+                .items
+                .get(index)
+                .map(|c| c.command.clone()),
+        }
+    }
+
+    fn panel_record_payload(&self, index: usize) -> Option<String> {
+        let text = self.panel_record_text(index)?;
+        Some(match self.left_page {
+            LeftPage::Jump => format!("cd {text}"),
+            LeftPage::Commands => text,
+        })
+    }
+
+    fn execute_panel_record(&mut self, index: usize) -> Result<()> {
+        let Some(payload) = self.panel_record_payload(index) else {
+            return Ok(());
+        };
+        let mut bytes = terminal_clear_line_bytes(&self.term);
+        bytes.extend_from_slice(payload.as_bytes());
+        self.focus = Focus::Terminal;
+        self.send_terminal_input(&bytes)
+    }
+
+    fn add_panel_record(&mut self) -> Result<()> {
+        match self.left_page {
+            LeftPage::Jump => {
+                let path = self.dir.path.to_string_lossy().into_owned();
+                self.push_panel_record(path);
+            }
+            LeftPage::Commands => {
+                let command = self.current_command();
+                if command.is_empty() {
+                    self.notify("当前命令为空".to_owned(), NoticeKind::Warn);
+                    return Ok(());
+                }
+                self.push_panel_record(command);
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_panel_record(&mut self, index: usize) {
+        let exists = match self.left_page {
+            LeftPage::Jump => index < self.config.jump.bookmarks.len(),
+            LeftPage::Commands => index < self.config.commands.items.len(),
+        };
+        if !exists {
+            return;
+        }
+        match self.left_page {
+            LeftPage::Jump => {
+                self.config.jump.bookmarks.remove(index);
+            }
+            LeftPage::Commands => {
+                self.config.commands.items.remove(index);
+            }
+        }
+        self.notify("已删除".to_owned(), NoticeKind::Info);
+        self.save_config();
+    }
+
+    fn save_config(&mut self) {
+        if let Err(e) = self.config.save() {
+            self.notify(format!("配置保存失败: {e}"), NoticeKind::Warn);
+        }
+    }
+
+    fn current_command(&self) -> String {
+        strip_prompt(&current_command_line(&self.term))
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_mouse(SCROLL_STEP, mouse.column, mouse.row),
             MouseEventKind::ScrollDown => self.scroll_mouse(-SCROLL_STEP, mouse.column, mouse.row),
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.panel_input.is_some() {
+                    if !self.panel_input_row_hit(mouse.column, mouse.row) {
+                        self.panel_input = None;
+                    }
+                    return Ok(());
+                }
+                let was_armed = self.armed_record.take();
                 if let Some((index, hit)) = self.island_hit(mouse.column, mouse.row) {
                     match hit {
                         IslandHit::Remove => self.remove_island(index)?,
@@ -582,10 +774,28 @@ impl App {
                     self.add_island()?;
                 } else if self.jump_button_hit(mouse.column, mouse.row) {
                     self.reset_scroll();
+                } else if ui::paged_add_hit(self.paged_panel, mouse.column, mouse.row) {
+                    self.panel_input = Some(String::new());
                 } else if let Some(page) =
                     ui::paged_tab_hit(self.paged_panel, mouse.column, mouse.row)
                 {
                     self.left_page = page;
+                    self.armed_record = None;
+                    self.panel_offset = 0;
+                } else if let Some((index, on_arrow)) = ui::paged_record_hit(
+                    self.paged_panel,
+                    mouse.column,
+                    mouse.row,
+                    self.paged_records_len(),
+                    self.clamped_panel_offset(),
+                    self.panel_input.is_some(),
+                ) {
+                    if on_arrow && was_armed == Some(index) {
+                        self.delete_panel_record(index);
+                    } else {
+                        self.armed_record = Some(index);
+                        self.execute_panel_record(index)?;
+                    }
                 } else if let Some(pos) = self.dir_cell_at(mouse.column, mouse.row) {
                     self.clear_all_selections();
                     self.dir_selection = Some(DirSelection::Rect(Selection {
@@ -652,12 +862,15 @@ impl App {
             self.islands[index].scroll_by(delta);
         } else if self.in_dir_pane(column, row) {
             let before = self.dir.offset;
-            self.dir.scroll_by(delta);
+            self.dir.scroll_by(-delta);
             if self.dir.offset != before
                 && matches!(self.dir_selection, Some(DirSelection::Rect(_)))
             {
                 self.dir_selection = None;
             }
+        } else if self.in_paged_pane(column, row) {
+            let total = self.paged_records_len() as i32;
+            self.panel_offset = (self.panel_offset as i32 - delta).clamp(0, total) as u16;
         } else {
             self.scroll_by(delta);
         }
@@ -666,6 +879,17 @@ impl App {
     fn in_dir_pane(&self, column: u16, row: u16) -> bool {
         let r = self.dir_pane_rect;
         column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
+    }
+
+    fn in_paged_pane(&self, column: u16, row: u16) -> bool {
+        let r = self.paged_panel;
+        column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
+    }
+
+    fn clamped_panel_offset(&self) -> u16 {
+        let len = self.paged_records_len();
+        let view = ui::paged_records_view(self.paged_panel, self.panel_input.is_some(), len);
+        ui::clamp_record_offset(self.panel_offset, len, view.visible())
     }
 
     fn clear_all_selections(&mut self) {
@@ -842,6 +1066,58 @@ fn selection_text(term: &vt100::Parser, sel: &Selection) -> String {
 
 fn dir_mtime(path: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
+}
+
+fn current_command_line(term: &vt100::Parser) -> String {
+    let screen = term.screen();
+    let (row, col) = screen.cursor_position();
+    let mut line = String::new();
+    for c in 0..col {
+        if let Some(cell) = screen.cell(row, c)
+            && !cell.is_wide_continuation()
+        {
+            line.push_str(cell.contents());
+        }
+    }
+    line
+}
+
+fn terminal_clear_line_bytes(term: &vt100::Parser) -> Vec<u8> {
+    let screen = term.screen();
+    let (row, col) = screen.cursor_position();
+    let (_, cols) = screen.size();
+    let mut left = 0usize;
+    let mut right = 0usize;
+    for c in 0..cols {
+        if let Some(cell) = screen.cell(row, c)
+            && !cell.is_wide_continuation()
+            && !cell.contents().is_empty()
+        {
+            if c < col {
+                left += 1;
+            } else {
+                right += 1;
+            }
+        }
+    }
+    let mut bytes = vec![0x7f; left];
+    for _ in 0..right {
+        bytes.extend_from_slice(b"\x1b[3~");
+    }
+    bytes
+}
+
+fn strip_prompt(line: &str) -> String {
+    let markers = [">", "$ ", "# ", "% "];
+    let mut cut = None;
+    for marker in markers {
+        if let Some(pos) = line.find(marker) {
+            let end = pos + marker.len();
+            cut = Some(cut.map_or(end, |c: usize| c.min(end)));
+        }
+    }
+    let cut = cut.unwrap_or(0);
+    line[cut..].trim().to_owned()
 }
 
 fn char_index_at(line: &str, col: u16) -> usize {
@@ -1570,7 +1846,16 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         app.handle_mouse(wheel).unwrap();
-        assert!(app.dir.offset > 0, "目录栏应滚动");
+        assert_eq!(app.dir.offset, 0, "已在顶部时滚轮向上不应下移列表");
+
+        let wheel_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel_down).unwrap();
+        assert!(app.dir.offset > 0, "滚轮向下应向列表后方滚动");
         assert_eq!(app.scroll(), 0, "主终端不应被影响");
 
         let outside = MouseEvent {
@@ -1795,13 +2080,13 @@ mod tests {
             is_dir: false,
         });
         let wheel = MouseEvent {
-            kind: MouseEventKind::ScrollUp,
+            kind: MouseEventKind::ScrollDown,
             column: 5,
             row: 5,
             modifiers: KeyModifiers::NONE,
         };
         app.handle_mouse(wheel).unwrap();
-        assert!(app.dir.offset > 0, "目录栏应滚动");
+        assert!(app.dir.offset > 0, "滚轮向下应向列表后方滚动");
         assert!(
             matches!(app.dir_selection, Some(DirSelection::Entry { .. })),
             "滚动后条目选区应保留"
@@ -1907,6 +2192,339 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &app)).unwrap();
         let buf = terminal.backend().buffer();
         assert!(!reversed(buf, 1, 3), "f0 滚出视图后该行不应再反白");
+    }
+
+    #[test]
+    fn click_record_executes_without_enter() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.left_page = LeftPage::Jump;
+        app.paged_panel = Rect::new(0, 0, 22, 12);
+        let long = "/very/long/path/that/overflows/the/pane/width/entirely";
+        app.config.jump.bookmarks = vec![long.to_owned()];
+        app.focus = Focus::Island(0);
+
+        assert_eq!(
+            app.panel_record_payload(0).unwrap(),
+            format!("cd {long}"),
+            "跳转负载应为 cd 命令且不带回车"
+        );
+
+        click_at(&mut app, 5, 1);
+        assert_eq!(app.focus, Focus::Terminal, "点击执行后焦点应回终端");
+        assert!(app.armed_record.is_some(), "点击后应同时进入待删状态");
+        assert!(
+            app.notice_text().is_none(),
+            "点击不再闪现完整内容，输入终端即可见"
+        );
+
+        let mut app = App::new(Config::default()).expect("app");
+        app.left_page = LeftPage::Commands;
+        app.config.commands.items = vec![CommandItem {
+            name: None,
+            command: "df -h".to_owned(),
+        }];
+        assert_eq!(app.panel_record_payload(0).unwrap(), "df -h");
+    }
+
+    #[test]
+    fn wheel_over_paged_panel_scrolls_records() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.left_page = LeftPage::Jump;
+        app.dir_pane_rect = Rect::new(60, 0, 22, 5);
+        app.paged_panel = Rect::new(0, 0, 22, 12);
+        app.config.jump.bookmarks = (0..50).map(|i| format!("/p{i}")).collect();
+
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel).unwrap();
+        assert_eq!(app.panel_offset, 0, "已在顶部时滚轮向上不应下移列表");
+
+        let wheel_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel_down).unwrap();
+        assert!(app.panel_offset > 0, "滚轮向下应向列表后方滚动");
+        assert_eq!(app.dir.offset, 0, "目录栏不应被影响");
+        assert_eq!(app.scroll(), 0, "主终端不应被影响");
+
+        app.panel_offset = 10;
+        app.handle_key(
+            press_key(KeyCode::F(1), KeyModifiers::NONE),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(app.panel_offset, 0, "切页应重置滚动偏移");
+    }
+
+    #[test]
+    fn adding_record_scrolls_to_show_it() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.left_page = LeftPage::Jump;
+        app.paged_panel = Rect::new(0, 0, 22, 12);
+        app.config.jump.bookmarks = (0..10).map(|i| format!("/p{i}")).collect();
+        app.dir.path = PathBuf::from("/tmp/newone");
+
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+            .unwrap();
+        assert_eq!(app.config.jump.bookmarks.len(), 11);
+        assert_eq!(app.panel_offset, 1, "添加后应滚动到能看到新记录");
+    }
+
+    #[test]
+    fn panel_input_bar_renders_at_panel_bottom() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new(Config::default()).expect("app");
+        app.panel_input = Some("hi".to_owned());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(1, 28)].symbol(), ">");
+        assert_eq!(buf[(3, 28)].symbol(), "h");
+        assert_eq!(buf[(4, 28)].symbol(), "i");
+        assert_eq!(buf[(5, 28)].symbol(), "▎");
+    }
+
+    #[test]
+    fn clear_line_bytes_backspace_left_and_delete_right() {
+        let mut term = vt100::Parser::new(5, 40, 100);
+        term.process(b"C:\\x>dir hello");
+        let bytes = terminal_clear_line_bytes(&term);
+        assert_eq!(bytes, vec![0x7f; 14], "光标在行尾时应全部用退格");
+
+        term.process(b"\x1b[1;10H");
+        let bytes = terminal_clear_line_bytes(&term);
+        assert_eq!(&bytes[..9], &[0x7f; 9], "光标前 9 个字符用退格");
+        assert_eq!(bytes[9..].len(), 5 * 4, "光标后 5 个字符各用一次 ESC[3~");
+        assert_eq!(&bytes[9..13], b"\x1b[3~");
+    }
+
+    #[test]
+    fn strips_prompt_markers() {
+        assert_eq!(strip_prompt("user@host:~$ cargo build"), "cargo build");
+        assert_eq!(strip_prompt("PS C:\\termiland> cargo test"), "cargo test");
+        assert_eq!(strip_prompt("zsh% ls -la"), "ls -la");
+        assert_eq!(strip_prompt("root# id"), "id");
+        assert_eq!(strip_prompt("no prompt here"), "no prompt here");
+        assert_eq!(strip_prompt("user@host:~$ "), "");
+        assert_eq!(strip_prompt("user@host:~$  spaced"), "spaced");
+        assert_eq!(
+            strip_prompt("C:\\Users\\z00958688>dir"),
+            "dir",
+            "cmd 提示符 > 后无空格也应截断"
+        );
+        assert_eq!(
+            strip_prompt("C:\\Users\\x>echo a > b"),
+            "echo a > b",
+            "命令内的重定向不应被误截"
+        );
+        assert_eq!(strip_prompt("user@h:~$ echo $HOME"), "echo $HOME");
+    }
+
+    #[test]
+    fn ctrl_i_adds_current_path_to_jump_page() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.left_page = LeftPage::Jump;
+        app.dir.path = PathBuf::from("/tmp/demo");
+
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+            .unwrap();
+        assert!(input.is_empty(), "Ctrl+I 不应发给 shell");
+        assert_eq!(app.config.jump.bookmarks, vec!["/tmp/demo".to_owned()]);
+
+        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+            .unwrap();
+        assert_eq!(app.config.jump.bookmarks.len(), 1, "重复添加应跳过");
+        let (notice, kind) = app.notice_text().expect("重复时应有提示");
+        assert_eq!(kind, NoticeKind::Warn);
+        assert!(notice.contains("已存在"), "提示内容: {notice}");
+    }
+
+    #[test]
+    fn ctrl_i_adds_current_command_to_commands_page() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.left_page = LeftPage::Commands;
+        app.term.process(b"user@host:~$ cargo build --release");
+
+        let mut input = Vec::new();
+        app.handle_key(
+            press_key(KeyCode::Char('i'), KeyModifiers::CONTROL),
+            &mut input,
+        )
+        .unwrap();
+        assert!(input.is_empty(), "Ctrl+I 不应发给 shell");
+        assert_eq!(
+            app.config.commands.items,
+            vec![CommandItem {
+                name: None,
+                command: "cargo build --release".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn ctrl_i_skips_when_command_empty() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.left_page = LeftPage::Commands;
+        app.term.process(b"user@host:~$ ");
+
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+            .unwrap();
+        assert!(app.config.commands.items.is_empty());
+        let (_, kind) = app.notice_text().expect("空命令应有提示");
+        assert_eq!(kind, NoticeKind::Warn);
+    }
+
+    #[test]
+    fn adding_record_persists_to_config_file() {
+        let path = std::env::temp_dir().join(format!("termiland-add-{}.toml", std::process::id()));
+        let config = Config {
+            save_path: Some(path.clone()),
+            ..Config::default()
+        };
+        let mut app = App::new(config).expect("app");
+        app.dir.path = PathBuf::from("/tmp/persist");
+        app.left_page = LeftPage::Jump;
+
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+            .unwrap();
+
+        let loaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(loaded.jump.bookmarks, ["/tmp/persist"]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn record_click_arms_and_arrow_click_deletes() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.left_page = LeftPage::Jump;
+        app.paged_panel = Rect::new(0, 0, 22, 12);
+        app.config.jump.bookmarks = vec!["/a".to_owned(), "/b".to_owned()];
+
+        click_at(&mut app, 2, 1);
+        assert_eq!(app.armed_record, Some(0), "点击条目应进入待删状态");
+
+        click_at(&mut app, 2, 1);
+        assert!(app.armed_record.is_none(), "删除后应退出待删状态");
+        assert_eq!(app.config.jump.bookmarks, vec!["/b".to_owned()]);
+
+        click_at(&mut app, 5, 1);
+        assert_eq!(app.armed_record, Some(0), "点击文字区域应选中该条");
+
+        click_at(&mut app, 2, 6);
+        assert!(app.armed_record.is_none(), "点击空白区域应退出待删状态");
+
+        click_at(&mut app, 2, 1);
+        app.handle_key(
+            press_key(KeyCode::F(1), KeyModifiers::NONE),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(app.armed_record.is_none(), "切页应清除待删状态");
+    }
+
+    #[test]
+    fn add_button_opens_input_bar() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.left_page = LeftPage::Jump;
+        app.paged_panel = Rect::new(0, 0, 22, 12);
+
+        click_at(&mut app, 19, 0);
+        assert_eq!(app.panel_input, Some(String::new()), "[+] 应打开输入栏");
+
+        for c in "C:\\custom\\path".chars() {
+            app.handle_key(
+                press_key(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        }
+        assert_eq!(app.panel_input.as_deref(), Some("C:\\custom\\path"));
+
+        app.handle_key(
+            press_key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(app.panel_input.is_none(), "回车后输入栏应关闭");
+        assert_eq!(
+            app.config.jump.bookmarks,
+            vec!["C:\\custom\\path".to_owned()]
+        );
+    }
+
+    #[test]
+    fn panel_input_esc_cancels_and_backspace_edits() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.left_page = LeftPage::Commands;
+        app.paged_panel = Rect::new(0, 0, 22, 12);
+        app.panel_input = Some(String::new());
+
+        for c in "df -hX".chars() {
+            app.handle_key(
+                press_key(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        }
+        app.handle_key(
+            press_key(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(app.panel_input.as_deref(), Some("df -h"));
+
+        app.handle_key(press_key(KeyCode::Esc, KeyModifiers::NONE), &mut Vec::new())
+            .unwrap();
+        assert!(app.panel_input.is_none());
+        assert!(app.config.commands.items.is_empty(), "取消不应添加记录");
+    }
+
+    #[test]
+    fn panel_input_swallows_keys_and_mouse() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.paged_panel = Rect::new(0, 0, 22, 12);
+        app.panel_input = Some("abc".to_owned());
+
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(1), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+            .unwrap();
+        assert_eq!(
+            app.left_page,
+            LeftPage::Jump,
+            "输入栏打开时 F1/Ctrl+I 应被吞掉"
+        );
+        assert!(input.is_empty(), "输入栏打开时不应有字节发给 shell");
+
+        click_at(&mut app, 5, 3);
+        assert!(app.panel_input.is_none(), "点击输入栏外应取消输入");
+        assert!(
+            app.dir_selection.is_none(),
+            "取消输入的点击不应触发其他动作"
+        );
+
+        app.panel_input = Some("keep".to_owned());
+        click_at(&mut app, 5, 10);
+        assert_eq!(
+            app.panel_input.as_deref(),
+            Some("keep"),
+            "点击输入栏所在行应保持输入"
+        );
     }
 
     #[test]

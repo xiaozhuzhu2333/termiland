@@ -31,6 +31,7 @@ const LINE_SEP: &str = "\n";
 pub enum NoticeKind {
     Info,
     Warn,
+    Highlight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +76,13 @@ impl Selection {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirSelection {
+    Rect(Selection),
+    Entry { name: String, is_dir: bool },
+    Path,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeftPage {
     Jump,
@@ -106,6 +114,7 @@ pub struct App {
     dir_pane_rect: Rect,
     scroll: u16,
     selection: Option<Selection>,
+    dir_selection: Option<DirSelection>,
     notice: Option<(String, Instant, NoticeKind)>,
     focus: Focus,
     trigger_pending: bool,
@@ -145,6 +154,7 @@ impl App {
             dir_pane_rect: Rect::default(),
             scroll: 0,
             selection: None,
+            dir_selection: None,
             notice: None,
             focus: Focus::Terminal,
             trigger_pending: false,
@@ -200,12 +210,28 @@ impl App {
         {
             self.dir = DirPane::load(cwd);
             self.dir_mtime = dir_mtime(&self.dir.path);
+            self.prune_dir_selection(true);
             return;
         }
         let mtime = dir_mtime(&self.dir.path);
         if mtime.is_some() && mtime != self.dir_mtime {
             self.dir_mtime = mtime;
             self.dir.reload();
+            self.prune_dir_selection(false);
+        }
+    }
+
+    fn prune_dir_selection(&mut self, cwd_changed: bool) {
+        let keep = match self.dir_selection.as_ref() {
+            Some(DirSelection::Entry { name, .. }) => {
+                self.dir.entries.iter().any(|e| e.name == *name)
+            }
+            Some(DirSelection::Path) => !cwd_changed,
+            Some(DirSelection::Rect(_)) => false,
+            None => false,
+        };
+        if !keep {
+            self.dir_selection = None;
         }
     }
 
@@ -304,6 +330,10 @@ impl App {
         self.selection
     }
 
+    pub fn dir_selection(&self) -> Option<&DirSelection> {
+        self.dir_selection.as_ref()
+    }
+
     pub fn focus(&self) -> Focus {
         self.focus
     }
@@ -377,9 +407,9 @@ impl App {
         } else if is_press
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
-            && self.has_focused_selection()
+            && self.has_any_selection()
         {
-            self.copy_focused_selection();
+            self.copy_active_selection();
         } else {
             match self.focus {
                 Focus::Terminal => self.handle_terminal_key(key, is_press, input),
@@ -423,31 +453,56 @@ impl App {
         }
     }
 
-    fn has_focused_selection(&self) -> bool {
-        match self.focus {
-            Focus::Terminal => self.selection.is_some(),
-            Focus::Island(i) => self
-                .islands
-                .get(i)
-                .is_some_and(|island| island.selection.is_some()),
+    fn has_any_selection(&self) -> bool {
+        self.selection.is_some()
+            || self.dir_selection.is_some()
+            || self.islands.iter().any(|i| i.selection.is_some())
+    }
+
+    fn copy_active_selection(&mut self) {
+        if let Some(sel) = self.selection {
+            self.copy_text(selection_text(&self.term, &sel));
+            return;
+        }
+        for island in &self.islands {
+            if let Some(sel) = island.selection {
+                self.copy_text(selection_text(&island.parser, &sel));
+                return;
+            }
+        }
+        if let Some(sel) = &self.dir_selection {
+            let text = self.dir_selection_text(sel);
+            self.copy_text(text);
         }
     }
 
-    fn copy_focused_selection(&mut self) {
-        let (term, sel) = match self.focus {
-            Focus::Terminal => (&self.term, self.selection),
-            Focus::Island(i) => match self.islands.get(i) {
-                Some(island) => (&island.parser, island.selection),
-                None => return,
-            },
-        };
-        let Some(sel) = sel else {
+    fn dir_selection_text(&self, sel: &DirSelection) -> String {
+        match sel {
+            DirSelection::Rect(rect) => {
+                let lines: Vec<String> = ui::dir_pane_lines(self.dir_pane_rect, self)
+                    .into_iter()
+                    .map(|(text, _)| text)
+                    .collect();
+                lines_selection_text(&lines, rect)
+            }
+            DirSelection::Entry { name, is_dir } => {
+                let mut text = name.clone();
+                if *is_dir {
+                    text.push('/');
+                }
+                text
+            }
+            DirSelection::Path => self.dir.path.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn copy_text(&mut self, text: String) {
+        if text.is_empty() {
             return;
-        };
+        }
         if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            let text = selection_text(term, &sel);
             let count = text.chars().count();
-            if !text.is_empty() && clipboard.set_text(text).is_ok() {
+            if clipboard.set_text(text).is_ok() {
                 self.notify(format!("已复制 {count} 字符"), NoticeKind::Info);
             }
         }
@@ -531,6 +586,12 @@ impl App {
                     ui::paged_tab_hit(self.paged_panel, mouse.column, mouse.row)
                 {
                     self.left_page = page;
+                } else if let Some(pos) = self.dir_cell_at(mouse.column, mouse.row) {
+                    self.clear_all_selections();
+                    self.dir_selection = Some(DirSelection::Rect(Selection {
+                        start: pos,
+                        end: pos,
+                    }));
                 } else if let Some(pos) = self.term_cell_at(mouse.column, mouse.row) {
                     self.clear_all_selections();
                     self.focus = Focus::Terminal;
@@ -554,6 +615,10 @@ impl App {
                     && let Some(sel) = &mut self.islands[index].selection
                 {
                     sel.end = pos;
+                } else if let Some(pos) = self.dir_cell_at(mouse.column, mouse.row)
+                    && let Some(DirSelection::Rect(sel)) = &mut self.dir_selection
+                {
+                    sel.end = pos;
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -561,6 +626,13 @@ impl App {
                     && sel.start == sel.end
                 {
                     self.selection = None;
+                }
+                let dir_click = match self.dir_selection {
+                    Some(DirSelection::Rect(sel)) if sel.start == sel.end => Some(sel.start),
+                    _ => None,
+                };
+                if let Some(anchor) = dir_click {
+                    self.dir_selection = self.pick_dir_selection(anchor);
                 }
                 for island in &mut self.islands {
                     if let Some(sel) = &mut island.selection
@@ -579,7 +651,13 @@ impl App {
         if let Some((index, _)) = self.island_hit(column, row) {
             self.islands[index].scroll_by(delta);
         } else if self.in_dir_pane(column, row) {
+            let before = self.dir.offset;
             self.dir.scroll_by(delta);
+            if self.dir.offset != before
+                && matches!(self.dir_selection, Some(DirSelection::Rect(_)))
+            {
+                self.dir_selection = None;
+            }
         } else {
             self.scroll_by(delta);
         }
@@ -592,9 +670,54 @@ impl App {
 
     fn clear_all_selections(&mut self) {
         self.selection = None;
+        self.dir_selection = None;
         for island in &mut self.islands {
             island.selection = None;
         }
+    }
+
+    fn dir_cell_at(&self, column: u16, row: u16) -> Option<(u16, u16)> {
+        let inner = ui::bordered_inner(self.dir_pane_rect);
+        if column >= inner.x
+            && column < inner.x + inner.width
+            && row >= inner.y
+            && row < inner.y + inner.height
+        {
+            Some((row - inner.y, column - inner.x))
+        } else {
+            None
+        }
+    }
+
+    fn pick_dir_selection(&mut self, anchor: (u16, u16)) -> Option<DirSelection> {
+        let (row, _col) = anchor;
+        let inner = ui::bordered_inner(self.dir_pane_rect);
+        if row == 0 {
+            let path = self.dir.path.to_string_lossy().into_owned();
+            if ui::display_width(&path) > inner.width {
+                self.notify(path, NoticeKind::Highlight);
+            }
+            return Some(DirSelection::Path);
+        }
+        if row == 1 {
+            return None;
+        }
+        let visible = inner.height.saturating_sub(2);
+        let offset = self.dir.clamped_offset(visible);
+        let index = offset as usize + (row as usize - 2);
+        let entry = self.dir.entries.get(index)?;
+        let name = entry.name.clone();
+        let is_dir = entry.is_dir;
+        let show_bar = self.dir.total() > visible;
+        let text_width = inner.width - u16::from(show_bar);
+        if ui::display_width(&name) + u16::from(is_dir) > text_width {
+            let mut text = name.clone();
+            if is_dir {
+                text.push('/');
+            }
+            self.notify(text, NoticeKind::Highlight);
+        }
+        Some(DirSelection::Entry { name, is_dir })
     }
 
     fn island_cell_at(&self, index: usize, column: u16, row: u16) -> Option<(u16, u16)> {
@@ -719,6 +842,53 @@ fn selection_text(term: &vt100::Parser, sel: &Selection) -> String {
 
 fn dir_mtime(path: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
+}
+
+fn char_index_at(line: &str, col: u16) -> usize {
+    let mut used = 0u16;
+    for (idx, ch) in line.chars().enumerate() {
+        if used >= col {
+            return idx;
+        }
+        used += if ch.is_ascii() { 1 } else { 2 };
+    }
+    line.chars().count()
+}
+
+fn lines_selection_text(lines: &[String], sel: &Selection) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let ((r1, c1), (r2, c2)) = sel.normalized();
+    let last = (lines.len() - 1) as u16;
+    let r2 = r2.min(last);
+    let mut out = String::new();
+    for row in r1..=r2 {
+        if row > last {
+            break;
+        }
+        let line = &lines[row as usize];
+        let start = if row == r1 {
+            char_index_at(line, c1)
+        } else {
+            0
+        };
+        let end = if row == r2 {
+            char_index_at(line, c2.saturating_add(1))
+        } else {
+            line.chars().count()
+        };
+        let slice: String = line
+            .chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect();
+        out.push_str(slice.trim_end());
+        if row != r2 {
+            out.push_str(LINE_SEP);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1457,6 +1627,326 @@ mod tests {
             app.dir.path.ends_with("tmp"),
             "目录栏应跟随 shell 的 cwd: {:?}",
             app.dir.path
+        );
+    }
+
+    #[test]
+    fn dir_pane_drag_select_and_ctrl_c_copies() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.dir_pane_rect = Rect::new(0, 0, 22, 20);
+        app.dir.entries = vec![
+            crate::dirpane::Entry {
+                name: "alpha".to_owned(),
+                is_dir: true,
+                hidden: false,
+            },
+            crate::dirpane::Entry {
+                name: "beta.txt".to_owned(),
+                is_dir: false,
+                hidden: false,
+            },
+        ];
+
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(down).unwrap();
+        assert!(app.dir_selection.is_some(), "按下应锚定目录栏选区");
+
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 8,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(drag).unwrap();
+        let Some(DirSelection::Rect(sel)) = &app.dir_selection else {
+            panic!("拖选后应为矩形选区");
+        };
+        assert_eq!(sel.normalized(), ((2, 1), (2, 7)));
+
+        let mut input = Vec::new();
+        app.handle_key(
+            press_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut input,
+        )
+        .unwrap();
+        assert!(input.is_empty(), "有选区时 Ctrl+C 不应发 SIGINT");
+    }
+
+    fn click_at(app: &mut App, column: u16, row: u16) {
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn click_entry_selects_and_copies_full_name() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.dir_pane_rect = Rect::new(0, 0, 22, 20);
+        let long_name = "very_long_file_name_that_overflows_the_pane_width.txt";
+        app.dir.entries = vec![
+            crate::dirpane::Entry {
+                name: "src".to_owned(),
+                is_dir: true,
+                hidden: false,
+            },
+            crate::dirpane::Entry {
+                name: long_name.to_owned(),
+                is_dir: false,
+                hidden: false,
+            },
+        ];
+
+        click_at(&mut app, 2, 4);
+
+        let Some(DirSelection::Entry { name, is_dir }) = &app.dir_selection else {
+            panic!("点击条目后应为整行选区");
+        };
+        assert_eq!(name, long_name);
+        assert!(!*is_dir);
+
+        let text = app.dir_selection_text(app.dir_selection.as_ref().unwrap());
+        assert_eq!(text, long_name, "复制应取完整文件名而非截断显示");
+
+        let (notice, kind) = app.notice_text().expect("截断时应闪现完整名");
+        assert_eq!(notice, long_name);
+        assert_eq!(kind, NoticeKind::Highlight);
+    }
+
+    #[test]
+    fn click_dir_entry_copies_name_with_slash() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.dir_pane_rect = Rect::new(0, 0, 22, 20);
+        app.dir.entries = vec![crate::dirpane::Entry {
+            name: "src".to_owned(),
+            is_dir: true,
+            hidden: false,
+        }];
+
+        click_at(&mut app, 2, 3);
+
+        let text = app.dir_selection_text(app.dir_selection.as_ref().expect("应选中条目"));
+        assert_eq!(text, "src/");
+    }
+
+    #[test]
+    fn click_path_row_selects_full_path() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.dir_pane_rect = Rect::new(0, 0, 22, 20);
+        let long_path = "C:\\very\\long\\directory\\path\\that\\cannot\\fit\\in\\pane";
+        app.dir.path = PathBuf::from(long_path);
+        app.dir.entries = Vec::new();
+
+        click_at(&mut app, 2, 1);
+
+        assert!(matches!(app.dir_selection, Some(DirSelection::Path)));
+        let text = app.dir_selection_text(app.dir_selection.as_ref().unwrap());
+        assert_eq!(text, long_path);
+
+        let (notice, kind) = app.notice_text().expect("路径截断时应闪现完整路径");
+        assert_eq!(notice, long_path);
+        assert_eq!(kind, NoticeKind::Highlight);
+    }
+
+    #[test]
+    fn click_blank_separator_and_empty_rows_clear_selection() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.dir_pane_rect = Rect::new(0, 0, 22, 20);
+        app.dir.entries = vec![crate::dirpane::Entry {
+            name: "only".to_owned(),
+            is_dir: false,
+            hidden: false,
+        }];
+
+        click_at(&mut app, 2, 2);
+        assert!(app.dir_selection.is_none(), "点击空白分隔行应无选区");
+
+        click_at(&mut app, 2, 5);
+        assert!(app.dir_selection.is_none(), "点击条目之外空行应无选区");
+    }
+
+    #[test]
+    fn dir_scroll_keeps_entry_and_clears_rect_selection() {
+        let mut app = App::new(Config::default()).expect("app");
+        app.dir_pane_rect = Rect::new(0, 0, 22, 10);
+        app.dir.entries = (0..50)
+            .map(|i| crate::dirpane::Entry {
+                name: format!("f{i}"),
+                is_dir: false,
+                hidden: false,
+            })
+            .collect();
+
+        app.dir_selection = Some(DirSelection::Entry {
+            name: "f0".to_owned(),
+            is_dir: false,
+        });
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel).unwrap();
+        assert!(app.dir.offset > 0, "目录栏应滚动");
+        assert!(
+            matches!(app.dir_selection, Some(DirSelection::Entry { .. })),
+            "滚动后条目选区应保留"
+        );
+
+        app.dir.offset = 0;
+        app.dir_selection = Some(DirSelection::Rect(Selection {
+            start: (2, 0),
+            end: (2, 3),
+        }));
+        app.handle_mouse(wheel).unwrap();
+        assert!(
+            app.dir_selection.is_none(),
+            "滚动后拖选矩形应清除，避免错位复制"
+        );
+    }
+
+    #[test]
+    fn dir_reload_prunes_stale_selections() {
+        let base = std::env::temp_dir().join(format!("termiland-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut app = App::new(Config::default()).expect("app");
+        app.dir = crate::dirpane::DirPane::load(base.clone());
+        app.dir_mtime = None;
+
+        app.dir_selection = Some(DirSelection::Entry {
+            name: "gone.txt".to_owned(),
+            is_dir: false,
+        });
+        app.last_dir_poll = Instant::now() - DIR_POLL_INTERVAL;
+        app.poll_dir_pane();
+        assert!(app.dir_selection.is_none(), "条目不存在时刷新后选区应清除");
+
+        std::fs::File::create(base.join("new_file.txt")).unwrap();
+        app.dir_selection = Some(DirSelection::Entry {
+            name: "new_file.txt".to_owned(),
+            is_dir: false,
+        });
+        app.dir_mtime = None;
+        app.last_dir_poll = Instant::now() - DIR_POLL_INTERVAL;
+        app.poll_dir_pane();
+        assert!(
+            matches!(app.dir_selection, Some(DirSelection::Entry { .. })),
+            "条目仍存在时选区应保留"
+        );
+
+        app.dir_selection = Some(DirSelection::Rect(Selection {
+            start: (2, 0),
+            end: (2, 3),
+        }));
+        std::fs::File::create(base.join("another.txt")).unwrap();
+        app.dir_mtime = None;
+        app.last_dir_poll = Instant::now() - DIR_POLL_INTERVAL;
+        app.poll_dir_pane();
+        assert!(app.dir_selection.is_none(), "刷新后拖选矩形应清除");
+
+        app.dir_selection = Some(DirSelection::Path);
+        std::fs::File::create(base.join("third.txt")).unwrap();
+        app.dir_mtime = None;
+        app.last_dir_poll = Instant::now() - DIR_POLL_INTERVAL;
+        app.poll_dir_pane();
+        assert!(
+            matches!(app.dir_selection, Some(DirSelection::Path)),
+            "目录未变时路径选区应保留"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn entry_selection_highlight_follows_scroll() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+
+        let mut app = App::new(Config::default()).expect("app");
+        app.dir.entries = (0..100)
+            .map(|i| crate::dirpane::Entry {
+                name: format!("f{i}"),
+                is_dir: false,
+                hidden: false,
+            })
+            .collect();
+        app.dir_selection = Some(DirSelection::Entry {
+            name: "f0".to_owned(),
+            is_dir: false,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let reversed = |buf: &ratatui::buffer::Buffer, x: u16, y: u16| {
+            buf[(x, y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        };
+        assert!(reversed(buf, 1, 3), "条目 f0 的首列应反白");
+        assert!(reversed(buf, 2, 3), "条目 f0 的次列应反白");
+        assert!(!reversed(buf, 3, 3), "条目文字之外不应反白");
+
+        app.dir.offset = 10;
+        terminal.draw(|f| ui::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(!reversed(buf, 1, 3), "f0 滚出视图后该行不应再反白");
+    }
+
+    #[test]
+    fn lines_selection_extraction_handles_wide_chars() {
+        let lines = vec![
+            "/some/path".to_owned(),
+            "alpha/".to_owned(),
+            "测试文件.txt".to_owned(),
+        ];
+        let sel = Selection {
+            start: (1, 0),
+            end: (1, 4),
+        };
+        assert_eq!(lines_selection_text(&lines, &sel), "alpha");
+
+        let sel = Selection {
+            start: (1, 0),
+            end: (1, 3),
+        };
+        assert_eq!(lines_selection_text(&lines, &sel), "alph");
+
+        let sel = Selection {
+            start: (2, 4),
+            end: (2, 4),
+        };
+        assert_eq!(lines_selection_text(&lines, &sel), "文", "单半宽字符选取");
+
+        let sel = Selection {
+            start: (2, 4),
+            end: (2, 6),
+        };
+        assert_eq!(lines_selection_text(&lines, &sel), "文件", "整宽字符选取");
+
+        let sel = Selection {
+            start: (0, 1),
+            end: (1, 5),
+        };
+        assert_eq!(
+            lines_selection_text(&lines, &sel),
+            format!("some/path{LINE_SEP}alpha/")
         );
     }
 

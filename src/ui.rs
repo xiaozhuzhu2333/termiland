@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::app::{App, Focus, LeftPage, NoticeKind, Selection};
+use crate::app::{App, DirSelection, Focus, LeftPage, NoticeKind, Selection};
 use crate::config::{CommandsConfig, JumpConfig, UiConfig};
 use crate::island::IslandState;
 
@@ -18,7 +18,7 @@ fn focus_border(focused: bool) -> Style {
 
 const TAB_LABELS: [&str; 2] = ["跳转", "命令"];
 
-fn display_width(s: &str) -> u16 {
+pub(crate) fn display_width(s: &str) -> u16 {
     s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
@@ -112,6 +112,10 @@ pub fn add_button_zone(bar: Rect) -> (u16, u16) {
 }
 
 pub fn island_inner(rect: Rect) -> Rect {
+    bordered_inner(rect)
+}
+
+pub fn bordered_inner(rect: Rect) -> Rect {
     Rect {
         x: rect.x.saturating_add(1),
         y: rect.y.saturating_add(1),
@@ -162,6 +166,7 @@ fn terminal_pane(f: &mut Frame, area: Rect, app: &App) {
         let style = match kind {
             NoticeKind::Warn => Style::new().fg(Color::Red),
             NoticeKind::Info => Style::new(),
+            NoticeKind::Highlight => Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
         };
         Line::from(Span::styled(text, style))
     } else if let Some(count) = app.selection_chars() {
@@ -277,6 +282,49 @@ fn left_column(f: &mut Frame, area: Rect, app: &App) {
     paged_panel(f, panel, app, focus_border(false));
 }
 
+pub fn dir_pane_lines(area: Rect, app: &App) -> Vec<(String, Style)> {
+    let inner = bordered_inner(area);
+    let mut lines = Vec::new();
+    if inner.width < 2 || inner.height < 2 {
+        return lines;
+    }
+    lines.push((
+        truncate_tail(&app.dir.path.to_string_lossy(), inner.width),
+        Style::new().fg(Color::DarkGray),
+    ));
+    if inner.height < 3 {
+        return lines;
+    }
+    lines.push((String::new(), Style::new()));
+    if let Some(err) = &app.dir.error {
+        lines.push((format!("读取失败: {err}"), Style::new().fg(Color::Red)));
+        return lines;
+    }
+    let visible = inner.height - 2;
+    let total = app.dir.total();
+    if total == 0 {
+        lines.push(("空目录".to_owned(), Style::new().fg(Color::DarkGray)));
+        return lines;
+    }
+    let offset = app.dir.clamped_offset(visible);
+    let show_bar = total > visible;
+    let text_width = inner.width - u16::from(show_bar);
+    for i in 0..visible {
+        let Some(entry) = app.dir.entries.get((offset + i) as usize) else {
+            break;
+        };
+        let style = if entry.is_dir {
+            Style::new().fg(Color::Cyan)
+        } else if entry.hidden {
+            Style::new().fg(Color::DarkGray)
+        } else {
+            Style::new()
+        };
+        lines.push((truncate_entry(&entry.name, entry.is_dir, text_width), style));
+    }
+    lines
+}
+
 fn dir_pane(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered()
         .border_style(focus_border(false))
@@ -287,87 +335,79 @@ fn dir_pane(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let path_line = truncate_tail(&app.dir.path.to_string_lossy(), inner.width);
-    f.render_widget(
-        Paragraph::new(Span::styled(path_line, Style::new().fg(Color::DarkGray))),
-        Rect { height: 1, ..inner },
-    );
-
-    let list = Rect {
-        y: inner.y + 1,
-        height: inner.height.saturating_sub(1),
-        ..inner
-    };
-    if let Some(err) = &app.dir.error {
+    let lines = dir_pane_lines(area, app);
+    for (i, (text, style)) in lines.iter().enumerate() {
         f.render_widget(
-            Paragraph::new(Span::styled(
-                format!("读取失败: {err}"),
-                Style::new().fg(Color::Red),
-            )),
-            list,
-        );
-        return;
-    }
-
-    let visible = list.height;
-    let total = app.dir.total();
-    if total == 0 {
-        f.render_widget(
-            Paragraph::new(Span::styled("空目录", Style::new().fg(Color::DarkGray)))
-                .alignment(Alignment::Center),
-            list,
-        );
-        return;
-    }
-    let offset = app.dir.clamped_offset(visible);
-    let show_bar = total > visible;
-    let text_width = inner.width - u16::from(show_bar);
-
-    for i in 0..visible {
-        let Some(entry) = app.dir.entries.get((offset + i) as usize) else {
-            break;
-        };
-        let label = truncate_entry(&entry.name, entry.is_dir, text_width);
-        let style = if entry.is_dir {
-            Style::new().fg(Color::Cyan)
-        } else if entry.hidden {
-            Style::new().fg(Color::DarkGray)
-        } else {
-            Style::new()
-        };
-        f.render_widget(
-            Paragraph::new(Span::styled(label, style)),
+            Paragraph::new(Span::styled(text.clone(), *style)),
             Rect {
-                y: list.y + i,
+                y: inner.y + i as u16,
                 height: 1,
-                width: text_width,
-                ..list
+                ..inner
             },
         );
     }
 
-    if show_bar {
+    let total = app.dir.total();
+    let visible = inner.height.saturating_sub(2);
+    if total > visible {
+        let offset = app.dir.clamped_offset(visible);
         let bar_x = inner.x + inner.width - 1;
-        for y in list.y..list.y + list.height {
+        let list_y = inner.y + 2;
+        for y in list_y..list_y + visible {
             f.buffer_mut()[(bar_x, y)]
                 .set_symbol("│")
                 .set_style(Style::new().fg(Color::DarkGray));
         }
-        let track = list.height;
+        let track = visible;
         let thumb_h = ((u32::from(track) * u32::from(visible)) / u32::from(total))
             .max(1)
             .min(u32::from(track)) as u16;
         let max_off = total - visible;
         let thumb_y = if max_off == 0 {
-            list.y
+            list_y
         } else {
-            list.y + (u32::from(offset) * u32::from(track - thumb_h) / u32::from(max_off)) as u16
+            list_y + (u32::from(offset) * u32::from(track - thumb_h) / u32::from(max_off)) as u16
         };
         for dy in 0..thumb_h {
             f.buffer_mut()[(bar_x, thumb_y + dy)]
                 .set_symbol("█")
                 .set_style(Style::new().fg(Color::Cyan));
         }
+    }
+
+    match app.dir_selection() {
+        Some(DirSelection::Rect(sel)) => {
+            for row in 0..inner.height {
+                for col in 0..inner.width {
+                    if sel.contains(row, col) {
+                        let cell = &mut f.buffer_mut()[(inner.x + col, inner.y + row)];
+                        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                    }
+                }
+            }
+        }
+        Some(DirSelection::Path) => reverse_row(f, inner, 0, &lines),
+        Some(DirSelection::Entry { name, .. }) => {
+            let visible = inner.height.saturating_sub(2);
+            let offset = app.dir.clamped_offset(visible);
+            if let Some(index) = app.dir.entries.iter().position(|e| e.name == *name)
+                && index >= offset as usize
+                && index < (offset + visible) as usize
+            {
+                reverse_row(f, inner, 2 + index as u16 - offset, &lines);
+            }
+        }
+        None => {}
+    }
+}
+
+fn reverse_row(f: &mut Frame, inner: Rect, row: u16, lines: &[(String, Style)]) {
+    let Some((text, _)) = lines.get(row as usize) else {
+        return;
+    };
+    for col in 0..display_width(text).min(inner.width) {
+        let cell = &mut f.buffer_mut()[(inner.x + col, inner.y + row)];
+        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
     }
 }
 
@@ -599,6 +639,24 @@ mod tests {
         assert_eq!((inner.height, inner.width), (28, 60));
         let inner = terminal_pane_inner(Rect::new(0, 0, 80, 24), cfg.left_width, cfg.right_width);
         assert_eq!((inner.height, inner.width), (22, 20));
+    }
+
+    #[test]
+    fn dir_pane_lines_insert_blank_separator() {
+        use crate::app::App;
+        use crate::config::Config;
+        use crate::dirpane::Entry;
+
+        let mut app = App::new(Config::default()).expect("app");
+        app.dir.entries = vec![Entry {
+            name: "alpha".to_owned(),
+            is_dir: true,
+            hidden: false,
+        }];
+
+        let lines = dir_pane_lines(Rect::new(0, 0, 22, 20), &app);
+        assert_eq!(lines[1].0, "", "路径行下应为空白分隔行");
+        assert_eq!(lines[2].0, "alpha/", "条目应从分隔行之后开始");
     }
 
     #[test]

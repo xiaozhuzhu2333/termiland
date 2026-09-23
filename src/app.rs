@@ -2706,17 +2706,16 @@ mod tests {
         let mut app = App::new(Config::default()).expect("app");
         app.left_page = LeftPage::Commands;
         app.term.process(b"user@host:~$ cargo build --release");
+        let before = app.config.commands.items.len();
 
         let mut input = Vec::new();
         app.handle_key(press_key(KeyCode::F(4), KeyModifiers::NONE), &mut input)
             .unwrap();
         assert!(input.is_empty(), "F4 不应发给 shell");
+        assert_eq!(app.config.commands.items.len(), before + 1);
         assert_eq!(
-            app.config.commands.items,
-            vec![CommandItem {
-                name: None,
-                command: "cargo build --release".to_owned(),
-            }]
+            app.config.commands.items.last().map(|c| c.command.as_str()),
+            Some("cargo build --release")
         );
     }
 
@@ -2725,11 +2724,16 @@ mod tests {
         let mut app = App::new(Config::default()).expect("app");
         app.left_page = LeftPage::Commands;
         app.term.process(b"user@host:~$ ");
+        let before = app.config.commands.items.len();
 
         let mut input = Vec::new();
         app.handle_key(press_key(KeyCode::F(4), KeyModifiers::NONE), &mut input)
             .unwrap();
-        assert!(app.config.commands.items.is_empty());
+        assert_eq!(
+            app.config.commands.items.len(),
+            before,
+            "空命令不应添加记录"
+        );
         let (_, kind) = app.notice_text().expect("空命令应有提示");
         assert_eq!(kind, NoticeKind::Warn);
     }
@@ -2819,6 +2823,7 @@ mod tests {
         app.left_page = LeftPage::Commands;
         app.paged_panel = Rect::new(0, 0, 22, 12);
         app.panel_input = Some(String::new());
+        let before = app.config.commands.items.len();
 
         for c in "df -hX".chars() {
             app.handle_key(
@@ -2837,7 +2842,7 @@ mod tests {
         app.handle_key(press_key(KeyCode::Esc, KeyModifiers::NONE), &mut Vec::new())
             .unwrap();
         assert!(app.panel_input.is_none());
-        assert!(app.config.commands.items.is_empty(), "取消不应添加记录");
+        assert_eq!(app.config.commands.items.len(), before, "取消不应添加记录");
     }
 
     #[test]

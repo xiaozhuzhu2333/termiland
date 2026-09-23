@@ -47,10 +47,35 @@ pub struct JumpConfig {
     pub bookmarks: Vec<String>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommandsConfig {
     pub items: Vec<CommandItem>,
+}
+
+impl Default for CommandsConfig {
+    fn default() -> Self {
+        Self {
+            items: default_commands(),
+        }
+    }
+}
+
+fn default_commands() -> Vec<CommandItem> {
+    if cfg!(target_os = "linux") {
+        vec![
+            CommandItem {
+                name: None,
+                command: "free -h".to_owned(),
+            },
+            CommandItem {
+                name: None,
+                command: "df -h".to_owned(),
+            },
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -126,7 +151,28 @@ mod tests {
         assert_eq!(cfg.ui.right_width, 36);
         assert_eq!(cfg.islands.max, 3);
         assert!(cfg.jump.bookmarks.is_empty());
-        assert!(cfg.commands.items.is_empty());
+        assert_eq!(
+            cfg.commands.items,
+            default_commands(),
+            "缺节时应回退默认命令"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_defaults_are_memory_and_disk() {
+        let defaults = default_commands();
+        assert_eq!(defaults.len(), 2);
+        assert_eq!(defaults[0].name, None, "默认命令不带名称，与手动添加一致");
+        assert_eq!(defaults[0].command, "free -h");
+        assert_eq!(defaults[1].name, None);
+        assert_eq!(defaults[1].command, "df -h");
+    }
+
+    #[test]
+    fn explicit_empty_items_opts_out_of_defaults() {
+        let cfg: Config = toml::from_str("[commands]\nitems = []").unwrap();
+        assert!(cfg.commands.items.is_empty(), "显式空列表应退出默认命令");
     }
 
     #[test]

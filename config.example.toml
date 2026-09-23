@@ -8,5 +8,9 @@ max = 3
 [jump]
 bookmarks = []
 
+# 命令页记录：name 可省略（省略时显示命令本身）
+# Linux 下缺省（无本节或无 items）时内置两条默认命令：free -h、df -h（不带名称）
+# 一旦在面板中增删过记录，全部记录（含默认）会写入此文件；
+# 显式写 items = [] 可永久排除默认命令
 [commands]
 items = []

@@ -127,16 +127,25 @@ pub struct App {
     should_quit: bool,
 }
 
+fn sane_area(width: u16, height: u16) -> Rect {
+    if width >= 2 && height >= 2 {
+        Rect::new(0, 0, width, height)
+    } else {
+        Rect::new(0, 0, 80, 24)
+    }
+}
+
 impl App {
     pub fn new(config: Config) -> Result<Self> {
-        let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-        let area = Rect::new(0, 0, width, height);
+        let area = crossterm::terminal::size()
+            .map(|(width, height)| sane_area(width, height))
+            .unwrap_or_else(|_| sane_area(80, 24));
         let pane_inner = ui::terminal_pane_inner(
             area,
             config.ui.left_width,
             ui::right_pane_width(&config.ui, false),
         );
-        let (rows, cols) = (pane_inner.height.max(1), pane_inner.width.max(1));
+        let (rows, cols) = (pane_inner.height.max(2), pane_inner.width.max(2));
         let pty = pty::PtySession::spawn(rows, cols)?;
         let term = vt100::Parser::new(rows, cols, SCROLLBACK_LEN);
         let mut app = Self {
@@ -253,7 +262,8 @@ impl App {
     }
 
     fn sync_layout(&mut self, terminal: &DefaultTerminal) -> Result<()> {
-        let area: Rect = terminal.size()?.into();
+        let size = terminal.size()?;
+        let area = sane_area(size.width, size.height);
         if area == self.layout_area && self.island_areas.len() == self.islands.len() {
             return Ok(());
         }
@@ -268,7 +278,7 @@ impl App {
         self.relayout_islands(area, left, right);
         self.paged_panel = ui::paged_panel_rect(area, left, right);
         self.dir_pane_rect = ui::dir_pane_rect(area, left, right);
-        let size = (self.pane_inner.height.max(1), self.pane_inner.width.max(1));
+        let size = (self.pane_inner.height.max(2), self.pane_inner.width.max(2));
         if self.pty_size != size {
             self.pty_size = size;
             self.pty.resize(size.0, size.1)?;
@@ -445,10 +455,7 @@ impl App {
             self.cycle_focus();
         } else if is_press && key.code == KeyCode::F(3) {
             self.add_island()?;
-        } else if is_press
-            && key.modifiers == KeyModifiers::CONTROL
-            && (key.code == KeyCode::Tab || key.code == KeyCode::Char('i'))
-        {
+        } else if is_press && key.code == KeyCode::F(4) {
             self.add_panel_record()?;
         } else if is_press
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
@@ -546,11 +553,14 @@ impl App {
         if text.is_empty() {
             return;
         }
-        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        if crate::clipboard::copy(&text) {
             let count = text.chars().count();
-            if clipboard.set_text(text).is_ok() {
-                self.notify(format!("已复制 {count} 字符"), NoticeKind::Info);
-            }
+            self.notify(format!("已复制 {count} 字符"), NoticeKind::Info);
+        } else {
+            self.notify(
+                "复制失败（内容过大或环境不支持）".to_owned(),
+                NoticeKind::Warn,
+            );
         }
     }
 
@@ -736,7 +746,7 @@ impl App {
     }
 
     fn current_command(&self) -> String {
-        strip_prompt(&current_command_line(&self.term))
+        strip_prompt(&terminal_line_before_cursor(&self.term))
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
@@ -1068,36 +1078,29 @@ fn dir_mtime(path: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-fn current_command_line(term: &vt100::Parser) -> String {
+fn terminal_line_before_cursor(term: &vt100::Parser) -> String {
     let screen = term.screen();
     let (row, col) = screen.cursor_position();
-    let mut line = String::new();
-    for c in 0..col {
-        if let Some(cell) = screen.cell(row, c)
-            && !cell.is_wide_continuation()
-        {
-            line.push_str(cell.contents());
-        }
-    }
-    line
+    screen
+        .contents_between(0, 0, row, col)
+        .rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn terminal_clear_line_bytes(term: &vt100::Parser) -> Vec<u8> {
+    let left = terminal_line_before_cursor(term).chars().count();
     let screen = term.screen();
     let (row, col) = screen.cursor_position();
     let (_, cols) = screen.size();
-    let mut left = 0usize;
     let mut right = 0usize;
-    for c in 0..cols {
+    for c in col..cols {
         if let Some(cell) = screen.cell(row, c)
             && !cell.is_wide_continuation()
             && !cell.contents().is_empty()
         {
-            if c < col {
-                left += 1;
-            } else {
-                right += 1;
-            }
+            right += 1;
         }
     }
     let mut bytes = vec![0x7f; left];
@@ -1868,11 +1871,27 @@ mod tests {
         assert!(app.scroll() > 0, "目录栏外滚动应作用于主终端");
     }
 
+    #[cfg(target_os = "linux")]
+    fn align_shell_cwd(app: &mut App, dir: &std::path::Path) {
+        app.send_terminal_input(format!("cd {}\r", dir.to_string_lossy()).as_bytes())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.dir.path != dir && Instant::now() < deadline {
+            let _ = app.pty.poll_output();
+            app.last_dir_poll = Instant::now() - DIR_POLL_INTERVAL;
+            app.poll_dir_pane();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(app.dir.path, dir, "shell 应已 cd 到测试目录");
+    }
+
     #[test]
     fn dir_pane_refreshes_on_mtime_change() {
         let base = std::env::temp_dir().join(format!("termiland-mtime-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         let mut app = App::new(Config::default()).expect("app");
+        #[cfg(target_os = "linux")]
+        align_shell_cwd(&mut app, &base);
         app.dir = crate::dirpane::DirPane::load(base.clone());
         app.dir_mtime = None;
 
@@ -1898,15 +1917,14 @@ mod tests {
     #[test]
     fn dir_pane_follows_shell_cwd() {
         let mut app = App::new(Config::default()).expect("app");
-        let initial = app.dir.path.clone();
 
         app.send_terminal_input(b"cd /tmp\r").unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while app.dir.path == initial && std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.dir.path.ends_with("tmp") && Instant::now() < deadline {
             let _ = app.pty.poll_output();
             app.last_dir_poll = Instant::now() - DIR_POLL_INTERVAL;
             app.poll_dir_pane();
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(50));
         }
         assert!(
             app.dir.path.ends_with("tmp"),
@@ -2109,6 +2127,8 @@ mod tests {
         let base = std::env::temp_dir().join(format!("termiland-prune-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         let mut app = App::new(Config::default()).expect("app");
+        #[cfg(target_os = "linux")]
+        align_shell_cwd(&mut app, &base);
         app.dir = crate::dirpane::DirPane::load(base.clone());
         app.dir_mtime = None;
 
@@ -2272,7 +2292,7 @@ mod tests {
         app.dir.path = PathBuf::from("/tmp/newone");
 
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+        app.handle_key(press_key(KeyCode::F(4), KeyModifiers::NONE), &mut input)
             .unwrap();
         assert_eq!(app.config.jump.bookmarks.len(), 11);
         assert_eq!(app.panel_offset, 1, "添加后应滚动到能看到新记录");
@@ -2307,6 +2327,27 @@ mod tests {
         assert_eq!(&bytes[..9], &[0x7f; 9], "光标前 9 个字符用退格");
         assert_eq!(bytes[9..].len(), 5 * 4, "光标后 5 个字符各用一次 ESC[3~");
         assert_eq!(&bytes[9..13], b"\x1b[3~");
+
+        let mut term = vt100::Parser::new(5, 10, 100);
+        term.process(b"C:\\x>dir hello");
+        assert_eq!(
+            terminal_line_before_cursor(&term),
+            "C:\\x>dir hello",
+            "跨行内容应拼接为完整逻辑行"
+        );
+        assert_eq!(
+            terminal_clear_line_bytes(&term),
+            vec![0x7f; 14],
+            "换行输入行清空应退格全部字符"
+        );
+    }
+
+    #[test]
+    fn sane_area_replaces_degenerate_sizes() {
+        assert_eq!(sane_area(1, 1), Rect::new(0, 0, 80, 24));
+        assert_eq!(sane_area(0, 30), Rect::new(0, 0, 80, 24));
+        assert_eq!(sane_area(120, 30), Rect::new(0, 0, 120, 30));
+        assert_eq!(sane_area(2, 2), Rect::new(0, 0, 2, 2));
     }
 
     #[test]
@@ -2332,38 +2373,45 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_i_adds_current_path_to_jump_page() {
+    fn f4_adds_current_path_to_jump_page() {
         let mut app = App::new(Config::default()).expect("app");
         app.left_page = LeftPage::Jump;
         app.dir.path = PathBuf::from("/tmp/demo");
 
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+        app.handle_key(press_key(KeyCode::F(4), KeyModifiers::NONE), &mut input)
             .unwrap();
-        assert!(input.is_empty(), "Ctrl+I 不应发给 shell");
+        assert!(input.is_empty(), "F4 不应发给 shell");
         assert_eq!(app.config.jump.bookmarks, vec!["/tmp/demo".to_owned()]);
 
-        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+        app.handle_key(press_key(KeyCode::F(4), KeyModifiers::NONE), &mut input)
             .unwrap();
         assert_eq!(app.config.jump.bookmarks.len(), 1, "重复添加应跳过");
         let (notice, kind) = app.notice_text().expect("重复时应有提示");
         assert_eq!(kind, NoticeKind::Warn);
         assert!(notice.contains("已存在"), "提示内容: {notice}");
+
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+            .unwrap();
+        assert_eq!(
+            input,
+            vec![b'\t'],
+            "Ctrl+I 不再拦截，应作为 Tab 字节发给 shell"
+        );
+        assert_eq!(app.config.jump.bookmarks.len(), 1, "Ctrl+I 不应触发收藏");
     }
 
     #[test]
-    fn ctrl_i_adds_current_command_to_commands_page() {
+    fn f4_adds_current_command_to_commands_page() {
         let mut app = App::new(Config::default()).expect("app");
         app.left_page = LeftPage::Commands;
         app.term.process(b"user@host:~$ cargo build --release");
 
         let mut input = Vec::new();
-        app.handle_key(
-            press_key(KeyCode::Char('i'), KeyModifiers::CONTROL),
-            &mut input,
-        )
-        .unwrap();
-        assert!(input.is_empty(), "Ctrl+I 不应发给 shell");
+        app.handle_key(press_key(KeyCode::F(4), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        assert!(input.is_empty(), "F4 不应发给 shell");
         assert_eq!(
             app.config.commands.items,
             vec![CommandItem {
@@ -2374,13 +2422,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_i_skips_when_command_empty() {
+    fn f4_skips_when_command_empty() {
         let mut app = App::new(Config::default()).expect("app");
         app.left_page = LeftPage::Commands;
         app.term.process(b"user@host:~$ ");
 
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+        app.handle_key(press_key(KeyCode::F(4), KeyModifiers::NONE), &mut input)
             .unwrap();
         assert!(app.config.commands.items.is_empty());
         let (_, kind) = app.notice_text().expect("空命令应有提示");
@@ -2399,7 +2447,7 @@ mod tests {
         app.left_page = LeftPage::Jump;
 
         let mut input = Vec::new();
-        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+        app.handle_key(press_key(KeyCode::F(4), KeyModifiers::NONE), &mut input)
             .unwrap();
 
         let loaded = Config::load(Some(&path)).unwrap();
@@ -2502,13 +2550,9 @@ mod tests {
         let mut input = Vec::new();
         app.handle_key(press_key(KeyCode::F(1), KeyModifiers::NONE), &mut input)
             .unwrap();
-        app.handle_key(press_key(KeyCode::Tab, KeyModifiers::CONTROL), &mut input)
+        app.handle_key(press_key(KeyCode::F(4), KeyModifiers::NONE), &mut input)
             .unwrap();
-        assert_eq!(
-            app.left_page,
-            LeftPage::Jump,
-            "输入栏打开时 F1/Ctrl+I 应被吞掉"
-        );
+        assert_eq!(app.left_page, LeftPage::Jump, "输入栏打开时 F1/F4 应被吞掉");
         assert!(input.is_empty(), "输入栏打开时不应有字节发给 shell");
 
         click_at(&mut app, 5, 3);
@@ -2604,6 +2648,7 @@ mod tests {
         assert_eq!(app.scroll(), 10);
 
         app.pane_inner = Rect::new(10, 1, 40, 20);
+        app.island_areas.clear();
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 48,

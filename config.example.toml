@@ -39,3 +39,6 @@ command = "echo t"
 
 [[commands.items]]
 command = "echo ppp"
+
+[[commands.items]]
+command = "ls"

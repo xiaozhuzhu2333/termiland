@@ -233,7 +233,7 @@ fn terminal_pane(f: &mut Frame, area: Rect, app: &App) {
         .title_top(status.right_aligned())
         .title_bottom(
             Line::from(Span::styled(
-                "Ctrl+Q 退出 · F2 岛栏 · F1 切页 · Ctrl+I 收藏",
+                "Ctrl+Q 退出 · F1 切页 · F2 岛栏 · F3 加岛 · F4 收藏",
                 Style::new().fg(Color::DarkGray),
             ))
             .right_aligned(),
@@ -677,8 +677,8 @@ fn paged_panel_lines(app: &App, offset: u16, view: &PagedRecordsView) -> Vec<Lin
     };
     if records.is_empty() {
         let hint = match app.left_page {
-            LeftPage::Jump => "Ctrl+I 添加当前路径",
-            LeftPage::Commands => "Ctrl+I 添加当前命令",
+            LeftPage::Jump => "F4 添加当前路径",
+            LeftPage::Commands => "F4 添加当前命令",
         };
         return vec![Line::from(Span::styled(
             hint,

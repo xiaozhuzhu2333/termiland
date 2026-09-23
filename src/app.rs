@@ -697,7 +697,7 @@ impl App {
             if let Some(island) = self.islands.get_mut(index)
                 && island.custom_path.take().is_some()
             {
-                self.notify("已恢复默认路径".to_owned(), NoticeKind::Info);
+                self.notify("已恢复终端路径".to_owned(), NoticeKind::Info);
             }
             return;
         }
@@ -1492,9 +1492,9 @@ mod tests {
         .unwrap();
         assert!(
             app.islands[0].custom_path.is_none(),
-            "空回车应清除指定路径回到默认"
+            "空回车应清除指定路径回到终端路径"
         );
-        assert!(app.notice_text().is_some(), "恢复默认应有提示");
+        assert!(app.notice_text().is_some(), "恢复终端路径应有提示");
     }
 
     #[test]

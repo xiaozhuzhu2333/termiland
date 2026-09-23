@@ -783,7 +783,7 @@ fn render_island(
     let (path_badge, path_color) = if island.custom_path.is_some() || path_text.is_some() {
         ("◆ 指定路径", Color::Cyan)
     } else {
-        ("◇ 默认路径", Color::DarkGray)
+        ("◇ 终端路径", Color::DarkGray)
     };
     let mut badge_spans = Vec::new();
     if island.scroll > 0 {

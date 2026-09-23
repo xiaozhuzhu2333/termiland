@@ -7,11 +7,15 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+const OSC_START: &[u8] = b"\x1b]";
+const OSC_BUFFER_CAP: usize = 4096;
 
 pub struct PtySession {
     master: Option<Box<dyn MasterPty + Send>>,
     writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
     cursor: Arc<Mutex<(u16, u16)>>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    cwd: Arc<Mutex<Option<String>>>,
     child: Box<dyn Child + Send + Sync>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     child_pid: Option<u32>,
@@ -47,11 +51,14 @@ impl PtySession {
         let thread_writer = Arc::clone(&writer);
         let cursor = Arc::new(Mutex::new((0, 0)));
         let thread_cursor = Arc::clone(&cursor);
+        let cwd = Arc::new(Mutex::new(None));
+        let thread_cwd = Arc::clone(&cwd);
         let (tx, rx) = mpsc::channel();
         let reader_thread = std::thread::Builder::new()
             .name("pty-reader".to_owned())
             .spawn(move || {
                 let mut carry = Vec::new();
+                let mut osc_buffer = Vec::new();
                 let mut buf = [0u8; 4096];
                 loop {
                     match reader.read(&mut buf) {
@@ -63,6 +70,12 @@ impl PtySession {
                                 &thread_writer,
                                 &thread_cursor,
                             );
+                            osc_buffer.extend_from_slice(&buf[..n]);
+                            if let Some(path) = extract_cwd_report(&mut osc_buffer)
+                                && let Ok(mut slot) = thread_cwd.lock()
+                            {
+                                *slot = Some(path);
+                            }
                             if tx.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
@@ -75,6 +88,7 @@ impl PtySession {
             master: Some(pair.master),
             writer: Some(writer),
             cursor,
+            cwd,
             child_pid: child.process_id(),
             child,
             reader_thread: Some(reader_thread),
@@ -87,6 +101,11 @@ impl PtySession {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn child_pid(&self) -> Option<u32> {
         self.child_pid
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn reported_cwd(&self) -> Option<String> {
+        self.cwd.lock().ok().and_then(|slot| slot.clone())
     }
 
     pub fn poll_output(&mut self) -> Vec<u8> {
@@ -192,18 +211,102 @@ fn cursor_report(cursor: &Mutex<(u16, u16)>) -> String {
     format!("\x1b[{};{}R", row + 1, col + 1)
 }
 
-#[cfg(unix)]
 fn default_shell_command() -> CommandBuilder {
     let mut cmd = CommandBuilder::new_default_prog();
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
+    #[cfg(unix)]
     if let Some(prompt) = history_flush_prompt(std::env::var("PROMPT_COMMAND").ok().as_deref()) {
         cmd.env("PROMPT_COMMAND", prompt);
+    }
+    #[cfg(windows)]
+    if let Some(prompt) = osc7_prompt(std::env::var("PROMPT").ok().as_deref()) {
+        cmd.env("PROMPT", prompt);
     }
     cmd
 }
 
-#[cfg(not(unix))]
-fn default_shell_command() -> CommandBuilder {
-    CommandBuilder::new_default_prog()
+#[cfg(windows)]
+fn osc7_prompt(existing: Option<&str>) -> Option<String> {
+    let tail = match existing {
+        Some(value) if !value.is_empty() => value,
+        _ => "$P$G",
+    };
+    if tail.contains("]7;") || tail.contains("]9;9;") {
+        return None;
+    }
+    Some(format!("$E]7;file:///$P$E\\$E]9;9;$P$E\\{tail}"))
+}
+
+fn extract_cwd_report(buffer: &mut Vec<u8>) -> Option<String> {
+    let mut last = None;
+    loop {
+        let Some(start) = find_subsequence(buffer, OSC_START) else {
+            if buffer.len() > OSC_START.len() {
+                buffer.drain(..buffer.len() - OSC_START.len());
+            }
+            return last;
+        };
+        let rest = &buffer[start + OSC_START.len()..];
+        let mut end = None;
+        let mut term_len = 0;
+        for (i, &b) in rest.iter().enumerate() {
+            if b == 0x07 {
+                end = Some(i);
+                term_len = 1;
+                break;
+            }
+            if b == 0x1b && rest.get(i + 1) == Some(&b'\\') {
+                end = Some(i);
+                term_len = 2;
+                break;
+            }
+        }
+        let Some(end) = end else {
+            buffer.drain(..start);
+            if buffer.len() > OSC_BUFFER_CAP {
+                buffer.clear();
+            }
+            return last;
+        };
+        if let Some(path) = parse_cwd_payload(&rest[..end]) {
+            last = Some(path);
+        }
+        buffer.drain(..start + OSC_START.len() + end + term_len);
+    }
+}
+
+fn parse_cwd_payload(payload: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(payload).ok()?;
+    if let Some(rest) = text.strip_prefix("7;") {
+        let rest = rest.strip_prefix("file://")?;
+        let path = match rest.find('/') {
+            Some(index) if index > 0 => &rest[index..],
+            _ => rest,
+        };
+        let path = match path.strip_prefix('/') {
+            Some(stripped) if !stripped.is_empty() && stripped.as_bytes().get(1) == Some(&b':') => {
+                stripped
+            }
+            _ => path,
+        };
+        return (!path.is_empty() && path != "/").then(|| path.to_owned());
+    }
+    if let Some(rest) = text.strip_prefix("9;9;") {
+        let path = rest.trim_matches('"');
+        return (!path.is_empty()).then(|| path.to_owned());
+    }
+    None
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 #[cfg(unix)]
@@ -219,6 +322,97 @@ fn history_flush_prompt(existing: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cwd_report_parses_osc7_and_windows_99() {
+        assert_eq!(
+            parse_cwd_payload(b"7;file:///C:\\Users\\z"),
+            Some("C:\\Users\\z".to_owned()),
+            "OSC 7 的 file:/// 前缀应剥除并保留盘符路径"
+        );
+        assert_eq!(
+            parse_cwd_payload(b"7;file://host/home/u"),
+            Some("/home/u".to_owned()),
+            "带主机的 OSC 7 应取路径部分"
+        );
+        assert_eq!(
+            parse_cwd_payload(b"9;9;\"C:\\Program Files\""),
+            Some("C:\\Program Files".to_owned()),
+            "OSC 9;9 应剥除引号"
+        );
+        assert_eq!(parse_cwd_payload(b"0;title"), None, "标题序列应忽略");
+        assert_eq!(parse_cwd_payload(b"7;file:///"), None);
+    }
+
+    #[test]
+    fn cwd_report_extracts_across_split_chunks() {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"junk\x1b]7;file:///");
+        assert_eq!(extract_cwd_report(&mut buffer), None, "未终结的序列应等待");
+        buffer.extend_from_slice(b"C:\\x\x1b\\rest");
+        assert_eq!(
+            extract_cwd_report(&mut buffer),
+            Some("C:\\x".to_owned()),
+            "跨块序列应拼接提取"
+        );
+
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"a\x1b]9;9;C:\\y\x07b\x1b]9;9;C:\\z\x07");
+        assert_eq!(
+            extract_cwd_report(&mut buffer),
+            Some("C:\\z".to_owned()),
+            "多条取最后一条"
+        );
+
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&vec![b'x'; 10_000]);
+        extract_cwd_report(&mut buffer);
+        assert!(
+            buffer.len() <= OSC_BUFFER_CAP.max(OSC_START.len()),
+            "无序列时缓冲区应有界"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn prompt_injection_preserves_existing_prompt() {
+        assert_eq!(
+            osc7_prompt(None).as_deref(),
+            Some("$E]7;file:///$P$E\\$E]9;9;$P$E\\$P$G"),
+            "无自定义 PROMPT 时保持默认外观"
+        );
+        assert_eq!(
+            osc7_prompt(Some("A$G")).as_deref(),
+            Some("$E]7;file:///$P$E\\$E]9;9;$P$E\\A$G"),
+            "已有 PROMPT 应拼接在后"
+        );
+        assert_eq!(
+            osc7_prompt(Some("$E]7;file:///$P$E\\$G")),
+            None,
+            "已注入过的不重复注入"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cmd_reports_cwd_via_osc() {
+        let mut session = PtySession::spawn(20, 80).expect("spawn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut sink = Vec::new();
+        while session.reported_cwd().is_none() && std::time::Instant::now() < deadline {
+            sink.extend(session.poll_output());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let reported = session
+            .reported_cwd()
+            .expect("cmd 首个提示符应上报 cwd（若失败说明 ConPTY 未透传 OSC，需换 PEB 方案）");
+        assert_eq!(
+            std::path::PathBuf::from(reported),
+            std::env::current_dir().unwrap(),
+            "终端启动目录应与 termiland 进程目录一致"
+        );
+        drop(sink);
+    }
 
     #[test]
     #[cfg(unix)]

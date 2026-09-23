@@ -6,39 +6,7 @@ right_width = 36
 max = 3
 
 [jump]
-bookmarks = [
-    "/var/log",
-    "/etc/nginx",
-    "/data",
-    'C:\termiland',
-]
+bookmarks = []
 
-[[commands.items]]
-command = "cls"
-
-[[commands.items]]
-command = "clss"
-
-[[commands.items]]
-command = "q"
-
-[[commands.items]]
-command = "qwe"
-
-[[commands.items]]
-command = "qwrrwq"
-
-[[commands.items]]
-command = "time /t"
-
-[[commands.items]]
-command = "echo time"
-
-[[commands.items]]
-command = "echo t"
-
-[[commands.items]]
-command = "echo ppp"
-
-[[commands.items]]
-command = "ls"
+[commands]
+items = []

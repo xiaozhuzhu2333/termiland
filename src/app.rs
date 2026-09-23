@@ -262,7 +262,12 @@ impl App {
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    fn shell_cwd(&self) -> Option<PathBuf> {
+        Some(PathBuf::from(self.pty.reported_cwd()?))
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
     fn shell_cwd(&self) -> Option<PathBuf> {
         None
     }

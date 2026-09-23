@@ -45,6 +45,7 @@ enum IslandHit {
     Body,
     Toggle,
     Remove,
+    Path,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +121,7 @@ pub struct App {
     armed_record: Option<usize>,
     panel_input: Option<String>,
     panel_offset: u16,
+    island_path_edit: Option<(usize, String)>,
     trigger_pending: bool,
     last_output_at: Instant,
     last_dir_poll: Instant,
@@ -172,6 +174,7 @@ impl App {
             armed_record: None,
             panel_input: None,
             panel_offset: 0,
+            island_path_edit: None,
             trigger_pending: false,
             last_output_at: Instant::now(),
             last_dir_poll: Instant::now(),
@@ -208,9 +211,12 @@ impl App {
             return;
         }
         self.trigger_pending = false;
-        for island in &mut self.islands {
+        let cwds: Vec<PathBuf> = (0..self.islands.len())
+            .map(|index| self.island_working_dir(index))
+            .collect();
+        for (island, cwd) in self.islands.iter_mut().zip(cwds) {
             if island.follow && island.armed {
-                island.execute();
+                island.execute(&cwd);
             }
         }
     }
@@ -318,6 +324,7 @@ impl App {
             return Ok(());
         }
         self.islands.remove(index);
+        self.island_path_edit = None;
         self.refresh_layout(self.layout_area)?;
         self.focus = match self.focus {
             Focus::Island(i) if i == index => Focus::Terminal,
@@ -366,6 +373,12 @@ impl App {
         self.panel_offset
     }
 
+    pub fn island_path_edit(&self) -> Option<(usize, &str)> {
+        self.island_path_edit
+            .as_ref()
+            .map(|(i, t)| (*i, t.as_str()))
+    }
+
     pub fn paged_records_len(&self) -> usize {
         match self.left_page {
             LeftPage::Jump => self.config.jump.bookmarks.len(),
@@ -393,17 +406,16 @@ impl App {
             match event::read()? {
                 Event::Key(key) => self.handle_key(key, &mut input)?,
                 Event::Paste(text) => {
-                    if self.panel_input.is_some() {
-                        let line: String =
-                            text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+                    let line: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+                    if let Some((_, buffer)) = &mut self.island_path_edit {
+                        buffer.push_str(&line);
+                    } else if self.panel_input.is_some() {
                         if let Some(buffer) = &mut self.panel_input {
                             buffer.push_str(&line);
                         }
                     } else {
                         match self.focus {
                             Focus::Island(_) => {
-                                let line: String =
-                                    text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
                                 self.edit_focused_command(Some(&line));
                             }
                             Focus::Terminal => input.extend_from_slice(&keys::paste_bytes(&text)),
@@ -438,6 +450,10 @@ impl App {
             return Ok(());
         }
         let is_press = key.kind == KeyEventKind::Press;
+        if is_press && self.island_path_edit.is_some() {
+            self.handle_island_path_key(key);
+            return Ok(());
+        }
         if is_press && self.panel_input.is_some() {
             self.handle_panel_input_key(key);
             return Ok(());
@@ -603,11 +619,16 @@ impl App {
     }
 
     fn execute_focused_island(&mut self) {
-        if let Focus::Island(i) = self.focus
-            && let Some(island) = self.islands.get_mut(i)
-        {
-            island.execute();
+        if let Focus::Island(i) = self.focus {
+            let cwd = self.island_working_dir(i);
+            if let Some(island) = self.islands.get_mut(i) {
+                island.execute(&cwd);
+            }
         }
+    }
+
+    fn island_cwd(&self) -> PathBuf {
+        self.shell_cwd().unwrap_or_else(|| self.dir.path.clone())
     }
 
     fn panel_input_row_hit(&self, column: u16, row: u16) -> bool {
@@ -646,6 +667,72 @@ impl App {
             return;
         }
         self.push_panel_record(text);
+    }
+
+    fn handle_island_path_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+        } else if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+            self.confirm_island_path();
+        } else if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            self.island_path_edit = None;
+        } else if key.code == KeyCode::Backspace && key.modifiers.is_empty() {
+            if let Some((_, text)) = &mut self.island_path_edit {
+                text.pop();
+            }
+        } else if let KeyCode::Char(c) = key.code
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+            && let Some((_, text)) = &mut self.island_path_edit
+        {
+            text.push(c);
+        }
+    }
+
+    fn confirm_island_path(&mut self) {
+        let Some((index, raw)) = self.island_path_edit.take() else {
+            return;
+        };
+        let text = raw.trim().to_owned();
+        if text.is_empty() {
+            if let Some(island) = self.islands.get_mut(index)
+                && island.custom_path.take().is_some()
+            {
+                self.notify("已恢复默认路径".to_owned(), NoticeKind::Info);
+            }
+            return;
+        }
+        let expanded = expand_tilde(&text);
+        if !expanded.is_absolute() {
+            self.notify(
+                "路径需为绝对路径（可用 ~ 开头）".to_owned(),
+                NoticeKind::Warn,
+            );
+            self.island_path_edit = Some((index, raw));
+            return;
+        }
+        if !expanded.is_dir() {
+            self.notify(
+                format!("路径不存在: {}", expanded.display()),
+                NoticeKind::Warn,
+            );
+            self.island_path_edit = Some((index, raw));
+            return;
+        }
+        if let Some(island) = self.islands.get_mut(index) {
+            island.custom_path = Some(expanded.to_string_lossy().into_owned());
+        }
+        self.notify(
+            format!("已指定路径 {}", expanded.display()),
+            NoticeKind::Info,
+        );
+    }
+
+    fn island_working_dir(&self, index: usize) -> PathBuf {
+        self.islands
+            .get(index)
+            .and_then(|island| island.custom_path.clone())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.island_cwd())
     }
 
     fn push_panel_record(&mut self, text: String) {
@@ -754,6 +841,14 @@ impl App {
             MouseEventKind::ScrollUp => self.scroll_mouse(SCROLL_STEP, mouse.column, mouse.row),
             MouseEventKind::ScrollDown => self.scroll_mouse(-SCROLL_STEP, mouse.column, mouse.row),
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((index, _)) = self.island_path_edit {
+                    let on_input_row = self.island_path_input_hit(index, mouse.column, mouse.row);
+                    let on_close = self.island_path_close_hit(index, mouse.column, mouse.row);
+                    if on_close || !on_input_row {
+                        self.island_path_edit = None;
+                    }
+                    return Ok(());
+                }
                 if self.panel_input.is_some() {
                     if !self.panel_input_row_hit(mouse.column, mouse.row) {
                         self.panel_input = None;
@@ -768,6 +863,12 @@ impl App {
                             self.clear_all_selections();
                             self.focus = Focus::Island(index);
                             self.toggle_island_follow(index);
+                        }
+                        IslandHit::Path => {
+                            self.clear_all_selections();
+                            self.focus = Focus::Island(index);
+                            let text = self.islands[index].custom_path.clone().unwrap_or_default();
+                            self.island_path_edit = Some((index, text));
                         }
                         IslandHit::Body => {
                             self.clear_all_selections();
@@ -968,6 +1069,20 @@ impl App {
         }
     }
 
+    fn island_path_input_hit(&self, index: usize, column: u16, row: u16) -> bool {
+        self.island_areas.get(index).is_some_and(|&area| {
+            let r = ui::island_path_input_row(area);
+            column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
+        })
+    }
+
+    fn island_path_close_hit(&self, index: usize, column: u16, row: u16) -> bool {
+        self.island_areas.get(index).is_some_and(|&area| {
+            let r = ui::island_path_close_zone(area);
+            column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
+        })
+    }
+
     fn island_hit(&self, column: u16, row: u16) -> Option<(usize, IslandHit)> {
         for (index, area) in self.island_areas.iter().enumerate() {
             if column >= area.x
@@ -977,8 +1092,10 @@ impl App {
             {
                 let hit = if row == area.y && column + 3 >= area.x + area.width {
                     IslandHit::Remove
-                } else if row == area.y && column + 13 >= area.x + area.width {
+                } else if row == area.y && column + 11 >= area.x + area.width {
                     IslandHit::Toggle
+                } else if row == area.y && column + 21 >= area.x + area.width {
+                    IslandHit::Path
                 } else {
                     IslandHit::Body
                 };
@@ -1087,6 +1204,17 @@ fn terminal_line_before_cursor(term: &vt100::Parser) -> String {
         .next()
         .unwrap_or_default()
         .to_owned()
+}
+
+fn expand_tilde(text: &str) -> PathBuf {
+    let Some(rest) = text.strip_prefix('~') else {
+        return PathBuf::from(text);
+    };
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    match home {
+        Some(home) => PathBuf::from(home).join(rest.trim_start_matches('/')),
+        None => PathBuf::from(text),
+    }
 }
 
 fn terminal_clear_line_bytes(term: &vt100::Parser) -> Vec<u8> {
@@ -1246,6 +1374,171 @@ mod tests {
         app.islands.push(crate::island::IslandState::empty(10, 36));
         app.island_areas = vec![Rect::new(50, 0, 36, 15), Rect::new(50, 15, 36, 15)];
         app
+    }
+
+    #[test]
+    fn island_path_badge_opens_editor_and_confirms() {
+        let mut app = app_with_islands();
+        let dir = std::env::temp_dir();
+
+        click_at(&mut app, 70, 0);
+        let (index, text) = app
+            .island_path_edit
+            .clone()
+            .expect("点击路径徽标应打开编辑");
+        assert_eq!(index, 0);
+        assert_eq!(text, "", "默认状态预填为空");
+        assert_eq!(app.focus, Focus::Island(0), "点击徽标应聚焦该岛");
+
+        for c in dir.to_string_lossy().chars() {
+            app.handle_key(
+                press_key(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        }
+        app.handle_key(
+            press_key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(app.island_path_edit.is_none(), "确认后编辑应关闭");
+        assert_eq!(
+            app.islands[0].custom_path.as_deref(),
+            Some(dir.to_string_lossy().as_ref()),
+            "确认后应保存指定路径"
+        );
+        let (_, kind) = app.notice_text().expect("确认应有提示");
+        assert_eq!(kind, NoticeKind::Info);
+        assert_eq!(app.island_working_dir(0), dir, "执行目录应使用指定路径");
+
+        click_at(&mut app, 70, 0);
+        let (_, text) = app.island_path_edit.clone().expect("再点徽标应重新编辑");
+        assert_eq!(text, dir.to_string_lossy(), "重新编辑应预填当前路径");
+    }
+
+    #[test]
+    fn island_path_editor_validates_and_cancels() {
+        let mut app = app_with_islands();
+        let dir = std::env::temp_dir();
+        app.islands[0].custom_path = Some(dir.to_string_lossy().into_owned());
+
+        click_at(&mut app, 70, 0);
+        for _ in 0..(dir.to_string_lossy().chars().count()) {
+            app.handle_key(
+                press_key(KeyCode::Backspace, KeyModifiers::NONE),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        }
+        for c in "relative/path".chars() {
+            app.handle_key(
+                press_key(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        }
+        app.handle_key(
+            press_key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(app.island_path_edit.is_some(), "相对路径应留在输入框");
+        let (_, kind) = app.notice_text().expect("校验失败应有提示");
+        assert_eq!(kind, NoticeKind::Warn);
+
+        app.handle_key(press_key(KeyCode::Esc, KeyModifiers::NONE), &mut Vec::new())
+            .unwrap();
+        assert!(app.island_path_edit.is_none(), "Esc 应取消编辑");
+        assert_eq!(
+            app.islands[0].custom_path.as_deref(),
+            Some(dir.to_string_lossy().as_ref()),
+            "取消编辑应保留原路径"
+        );
+
+        click_at(&mut app, 70, 0);
+        click_at(&mut app, 5, 5);
+        assert!(app.island_path_edit.is_none(), "点击输入框外应取消编辑");
+        assert!(
+            app.islands[0].custom_path.is_some(),
+            "取消编辑不应清除原路径"
+        );
+
+        click_at(&mut app, 70, 0);
+        click_at(&mut app, 63, 1);
+        assert!(app.island_path_edit.is_some(), "点击输入框所在行应保持编辑");
+
+        click_at(&mut app, 83, 1);
+        assert!(app.island_path_edit.is_none(), "点击 × 应关闭输入框");
+        assert!(app.islands[0].custom_path.is_some(), "× 关闭应保留原路径");
+
+        click_at(&mut app, 70, 0);
+        let len = app
+            .island_path_edit
+            .as_ref()
+            .map(|(_, t)| t.chars().count())
+            .unwrap_or_default();
+        for _ in 0..len {
+            app.handle_key(
+                press_key(KeyCode::Backspace, KeyModifiers::NONE),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        }
+        app.handle_key(
+            press_key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            app.islands[0].custom_path.is_none(),
+            "空回车应清除指定路径回到默认"
+        );
+        assert!(app.notice_text().is_some(), "恢复默认应有提示");
+    }
+
+    #[test]
+    fn island_path_editor_is_modal() {
+        let mut app = app_with_islands();
+        click_at(&mut app, 70, 0);
+
+        let mut input = Vec::new();
+        app.handle_key(press_key(KeyCode::F(4), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        app.handle_key(press_key(KeyCode::F(1), KeyModifiers::NONE), &mut input)
+            .unwrap();
+        assert!(input.is_empty(), "编辑期间按键不应发给 shell");
+        assert_eq!(app.left_page, LeftPage::Jump, "编辑期间 F1 应被吞掉");
+        assert!(
+            app.config.jump.bookmarks.is_empty(),
+            "编辑期间 F4 不应触发收藏"
+        );
+        assert!(
+            app.islands[0].command.is_empty(),
+            "编辑期间字符不应进入岛命令"
+        );
+
+        app.handle_key(
+            press_key(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            app.island_path_edit.as_ref().map(|(_, t)| t.clone()),
+            Some("/".to_owned()),
+            "字符应进入路径输入框"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_resolves_home() {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap();
+        assert_eq!(expand_tilde("~/data"), PathBuf::from(&home).join("data"));
+        assert_eq!(expand_tilde("~"), PathBuf::from(&home));
+        assert_eq!(expand_tilde("/abs"), PathBuf::from("/abs"));
+        assert_eq!(expand_tilde("relative"), PathBuf::from("relative"));
     }
 
     #[test]
@@ -1721,7 +2014,8 @@ mod tests {
     fn del_removes_focused_island() {
         let mut app = app_with_islands();
         app.islands[0].command = "ping -t 127.0.0.1".to_owned();
-        app.islands[0].execute();
+        let cwd = app.island_cwd();
+        app.islands[0].execute(&cwd);
         assert!(app.islands[0].session.is_some(), "岛内应有运行中进程");
 
         let mut input = Vec::new();

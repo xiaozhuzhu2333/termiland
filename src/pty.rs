@@ -23,7 +23,7 @@ pub struct PtySession {
 
 impl PtySession {
     pub fn spawn(rows: u16, cols: u16) -> Result<Self> {
-        Self::spawn_command(CommandBuilder::new_default_prog(), rows, cols)
+        Self::spawn_command(default_shell_command(), rows, cols)
     }
 
     pub fn spawn_command(cmd: CommandBuilder, rows: u16, cols: u16) -> Result<Self> {
@@ -192,9 +192,57 @@ fn cursor_report(cursor: &Mutex<(u16, u16)>) -> String {
     format!("\x1b[{};{}R", row + 1, col + 1)
 }
 
+#[cfg(unix)]
+fn default_shell_command() -> CommandBuilder {
+    let mut cmd = CommandBuilder::new_default_prog();
+    if let Some(prompt) = history_flush_prompt(std::env::var("PROMPT_COMMAND").ok().as_deref()) {
+        cmd.env("PROMPT_COMMAND", prompt);
+    }
+    cmd
+}
+
+#[cfg(not(unix))]
+fn default_shell_command() -> CommandBuilder {
+    CommandBuilder::new_default_prog()
+}
+
+#[cfg(unix)]
+fn history_flush_prompt(existing: Option<&str>) -> Option<String> {
+    match existing {
+        Some(value) if value.contains("history -a") => None,
+        Some("") => Some("history -a".to_owned()),
+        Some(value) => Some(format!("history -a; {value}")),
+        None => Some("history -a".to_owned()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn prompt_command_injection_combines() {
+        assert_eq!(
+            history_flush_prompt(None).as_deref(),
+            Some("history -a"),
+            "无既有值时注入基础落盘命令"
+        );
+        assert_eq!(
+            history_flush_prompt(Some("")).as_deref(),
+            Some("history -a")
+        );
+        assert_eq!(
+            history_flush_prompt(Some("foo")).as_deref(),
+            Some("history -a; foo"),
+            "既有值应追加在后"
+        );
+        assert_eq!(
+            history_flush_prompt(Some("history -a; foo")),
+            None,
+            "已含 history -a 时不重复注入"
+        );
+    }
 
     struct Sink(std::sync::mpsc::Sender<Vec<u8>>);
 

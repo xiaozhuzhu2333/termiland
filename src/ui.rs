@@ -729,7 +729,17 @@ fn islands_column(f: &mut Frame, area: Rect, app: &App) {
         let heights: Vec<Option<u16>> = app.islands.iter().map(|i| i.height).collect();
         let areas = island_layout(body, &heights);
         for (index, (island, &island_area)) in app.islands.iter().zip(areas.iter()).enumerate() {
-            render_island(f, island_area, island, app.focus() == Focus::Island(index));
+            let path_text = app
+                .island_path_edit()
+                .filter(|(i, _)| *i == index)
+                .map(|(_, text)| text.to_owned());
+            render_island(
+                f,
+                island_area,
+                island,
+                app.focus() == Focus::Island(index),
+                path_text.as_deref(),
+            );
         }
     }
     let bar_line = Line::from(Span::styled(
@@ -739,7 +749,27 @@ fn islands_column(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(bar_line).alignment(Alignment::Center), bar);
 }
 
-fn render_island(f: &mut Frame, area: Rect, island: &IslandState, focused: bool) {
+pub fn island_path_input_row(area: Rect) -> Rect {
+    let inner = bordered_inner(area);
+    Rect { height: 1, ..inner }
+}
+
+pub fn island_path_close_zone(area: Rect) -> Rect {
+    let row = island_path_input_row(area);
+    Rect {
+        x: row.x + row.width.saturating_sub(3),
+        width: 3,
+        ..row
+    }
+}
+
+fn render_island(
+    f: &mut Frame,
+    area: Rect,
+    island: &IslandState,
+    focused: bool,
+    path_text: Option<&str>,
+) {
     let title = if island.command.is_empty() {
         "岛".to_owned()
     } else {
@@ -750,6 +780,11 @@ fn render_island(f: &mut Frame, area: Rect, island: &IslandState, focused: bool)
     } else {
         ("○ 单次", Color::DarkGray)
     };
+    let (path_badge, path_color) = if island.custom_path.is_some() || path_text.is_some() {
+        ("◆ 指定路径", Color::Cyan)
+    } else {
+        ("◇ 默认路径", Color::DarkGray)
+    };
     let mut badge_spans = Vec::new();
     if island.scroll > 0 {
         badge_spans.push(Span::styled(
@@ -757,6 +792,8 @@ fn render_island(f: &mut Frame, area: Rect, island: &IslandState, focused: bool)
             Style::new().fg(Color::DarkGray),
         ));
     }
+    badge_spans.push(Span::styled(path_badge, Style::new().fg(path_color)));
+    badge_spans.push(Span::raw(" "));
     badge_spans.push(Span::styled(badge, Style::new().fg(badge_color)));
     badge_spans.push(Span::raw(" "));
     badge_spans.push(Span::styled("×", Style::new().fg(Color::Red)));
@@ -776,6 +813,39 @@ fn render_island(f: &mut Frame, area: Rect, island: &IslandState, focused: bool)
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let body = if let Some(text) = path_text {
+        let row = island_path_input_row(area);
+        let text_area = Rect {
+            width: row.width.saturating_sub(3),
+            ..row
+        };
+        let close = Rect {
+            x: row.x + row.width.saturating_sub(3),
+            width: 3,
+            ..row
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("> ", Style::new().fg(Color::Cyan)),
+                Span::raw(text.to_owned()),
+                Span::styled("▎", Style::new().fg(Color::Cyan)),
+            ])),
+            text_area,
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled("×", Style::new().fg(Color::Red)))
+                .alignment(Alignment::Right),
+            close,
+        );
+        Rect {
+            y: inner.y + 1,
+            height: inner.height.saturating_sub(1),
+            ..inner
+        }
+    } else {
+        inner
+    };
+
     if island.command.is_empty() {
         f.render_widget(
             Paragraph::new(Span::styled(
@@ -783,13 +853,12 @@ fn render_island(f: &mut Frame, area: Rect, island: &IslandState, focused: bool)
                 Style::new().fg(Color::DarkGray),
             ))
             .alignment(Alignment::Center),
-            inner,
+            body,
         );
         return;
     }
 
-    let [output, input] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let [output, input] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(body);
     render_screen(f, output, island.parser.screen(), island.selection);
     let prompt = Line::from(vec![
         Span::styled(
@@ -803,7 +872,7 @@ fn render_island(f: &mut Frame, area: Rect, island: &IslandState, focused: bool)
         Span::raw(island.command.clone()),
     ]);
     f.render_widget(Paragraph::new(prompt), input);
-    if focused {
+    if focused && path_text.is_none() {
         let cursor_x = input.x + 2 + display_width(&island.command);
         if cursor_x < input.x + input.width {
             f.set_cursor_position((cursor_x, input.y));

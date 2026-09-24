@@ -27,7 +27,7 @@ pub fn sanitize_resize_boundary(parser: &mut vt100::Parser, new_cols: u16) {
     }
     let mut seq = String::from("\x1b7");
     for row in bad_rows {
-        seq.push_str(&format!("\x1b[{row};{new_cols}H "));
+        seq.push_str(&format!("\x1b[{};{new_cols}H ", row + 1));
     }
     seq.push_str("\x1b8");
     parser.process(seq.as_bytes());
@@ -174,11 +174,32 @@ fn shell_command(command: &str, cwd: &std::path::Path) -> CommandBuilder {
     cmd
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn sanitize_destroys_dangling_wide_at_boundary() {
+        let mut parser = vt100::Parser::new(4, 10, 100);
+        parser.process("\x1b[3;9H中文".as_bytes());
+        assert!(
+            parser.screen().cell(2, 8).is_some_and(|c| c.is_wide()),
+            "前置：宽字符对应位于 8-9 列"
+        );
+        sanitize_resize_boundary(&mut parser, 9);
+        assert!(
+            !parser.screen().cell(2, 8).is_some_and(|c| c.is_wide()),
+            "收窄前边界列上的宽字符首格应被空格覆盖"
+        );
+        parser.screen_mut().set_size(4, 9);
+        assert!(
+            !parser.screen().cell(2, 8).is_some_and(|c| c.is_wide()),
+            "set_size 裁剪后不应残留悬挂宽字符"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn bash_islands_preload_history_file() {
         assert_eq!(
             island_command_line("/bin/bash", "echo hi"),
@@ -202,6 +223,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn island_shell_resolves_user_shell_with_interactive_flag() {
         let cwd = std::env::temp_dir();
         let builder = shell_command("echo hi", &cwd);

@@ -395,6 +395,46 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn narrow_resize_with_wide_chars_keeps_grid_consistent() {
+        let mut session = PtySession::spawn(10, 60).expect("spawn");
+        session
+            .write_input("echo AAAA中文BBBB中文CCCC中文DDDD\r".as_bytes())
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut parser = vt100::Parser::new(10, 60, 1000);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let out = session.poll_output();
+            parser.process(&out);
+            if parser.screen().contents().contains("CCCC") {
+                break;
+            }
+        }
+        let assert_no_dangling_wide = |parser: &vt100::Parser, new_cols: u16| {
+            let (rows, cols) = parser.screen().size();
+            for row in 0..rows {
+                assert!(
+                    !parser
+                        .screen()
+                        .cell(row, cols - 1)
+                        .is_some_and(|c| c.is_wide()),
+                    "收窄到 {new_cols} 后行 {row} 末列残留悬挂宽字符"
+                );
+            }
+        };
+        for new_cols in (28..60).rev() {
+            session.resize(10, new_cols).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            crate::island::sanitize_resize_boundary(&mut parser, new_cols);
+            parser.screen_mut().set_size(10, new_cols);
+            let out = session.poll_output();
+            parser.process(&out);
+            assert_no_dangling_wide(&parser, new_cols);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn cmd_reports_cwd_via_osc() {
         let mut session = PtySession::spawn(20, 80).expect("spawn");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);

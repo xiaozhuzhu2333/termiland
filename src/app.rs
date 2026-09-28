@@ -137,6 +137,20 @@ fn sane_area(width: u16, height: u16) -> Rect {
     }
 }
 
+fn is_copy_shortcut(key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('c') | KeyCode::Char('C') => ctrl,
+        KeyCode::Insert => ctrl,
+        _ => false,
+    }
+}
+
+fn is_backspace(key: &KeyEvent) -> bool {
+    (key.code == KeyCode::Backspace && key.modifiers.is_empty())
+        || (key.code == KeyCode::Char('h') && key.modifiers == KeyModifiers::CONTROL)
+}
+
 impl App {
     pub fn new(config: Config) -> Result<Self> {
         let area = crossterm::terminal::size()
@@ -478,11 +492,7 @@ impl App {
             self.add_island()?;
         } else if is_press && key.code == KeyCode::F(4) {
             self.add_panel_record()?;
-        } else if is_press
-            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && self.has_any_selection()
-        {
+        } else if is_press && is_copy_shortcut(&key) && self.has_any_selection() {
             self.copy_active_selection();
         } else {
             match self.focus {
@@ -504,8 +514,7 @@ impl App {
                         self.remove_focused_island()?;
                     } else if is_press && key.code == KeyCode::Enter && key.modifiers.is_empty() {
                         self.execute_focused_island();
-                    } else if is_press && key.code == KeyCode::Backspace && key.modifiers.is_empty()
-                    {
+                    } else if is_press && is_backspace(&key) {
                         self.edit_focused_command(None);
                     } else if is_press
                         && let KeyCode::Char(c) = key.code
@@ -651,7 +660,7 @@ impl App {
             self.confirm_panel_input();
         } else if key.code == KeyCode::Esc && key.modifiers.is_empty() {
             self.panel_input = None;
-        } else if key.code == KeyCode::Backspace && key.modifiers.is_empty() {
+        } else if is_backspace(&key) {
             if let Some(text) = &mut self.panel_input {
                 text.pop();
             }
@@ -681,7 +690,7 @@ impl App {
             self.confirm_island_path();
         } else if key.code == KeyCode::Esc && key.modifiers.is_empty() {
             self.island_path_edit = None;
-        } else if key.code == KeyCode::Backspace && key.modifiers.is_empty() {
+        } else if is_backspace(&key) {
             if let Some((_, text)) = &mut self.island_path_edit {
                 text.pop();
             }
@@ -2647,6 +2656,88 @@ mod tests {
         assert_eq!(sane_area(0, 30), Rect::new(0, 0, 80, 24));
         assert_eq!(sane_area(120, 30), Rect::new(0, 0, 120, 30));
         assert_eq!(sane_area(2, 2), Rect::new(0, 0, 2, 2));
+    }
+
+    #[test]
+    fn copy_shortcuts_cover_ctrl_insert_and_ctrl_shift_c() {
+        assert!(is_copy_shortcut(&press_key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_copy_shortcut(&press_key(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert!(is_copy_shortcut(&press_key(
+            KeyCode::Insert,
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_copy_shortcut(&press_key(
+            KeyCode::Insert,
+            KeyModifiers::NONE
+        )));
+        assert!(!is_copy_shortcut(&press_key(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+
+        let mut app = App::new(Config::default()).expect("app");
+        app.selection = Some(Selection {
+            start: (0, 0),
+            end: (0, 2),
+        });
+        let mut input = Vec::new();
+        app.handle_key(
+            press_key(KeyCode::Insert, KeyModifiers::CONTROL),
+            &mut input,
+        )
+        .unwrap();
+        assert!(input.is_empty(), "Ctrl+Insert 有选区时应拦截为复制");
+
+        app.selection = None;
+        app.notice = None;
+        app.handle_key(
+            press_key(KeyCode::Insert, KeyModifiers::CONTROL),
+            &mut input,
+        )
+        .unwrap();
+        assert!(!input.is_empty(), "无选区时 Ctrl+Insert 应透传给 shell");
+    }
+
+    #[test]
+    fn ctrl_h_works_as_backspace_everywhere() {
+        let mut app = app_with_islands();
+        app.focus = Focus::Island(0);
+        app.islands[0].command = "abc".to_owned();
+        app.handle_key(
+            press_key(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            app.islands[0].command, "ab",
+            "岛命令编辑应把 Ctrl+H 当退格（XShell 的 BS 编码）"
+        );
+
+        app.panel_input = Some("xy".to_owned());
+        app.handle_key(
+            press_key(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(app.panel_input.as_deref(), Some("x"), "面板输入栏同理");
+
+        app.island_path_edit = Some((0, "/ab".to_owned()));
+        app.handle_key(
+            press_key(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            app.island_path_edit.map(|(_, t)| t),
+            Some("/a".to_owned()),
+            "岛路径输入同理"
+        );
     }
 
     #[test]

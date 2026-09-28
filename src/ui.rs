@@ -1,4 +1,5 @@
 use ratatui::Frame;
+use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -181,6 +182,40 @@ pub fn draw(f: &mut Frame, app: &App) {
     terminal_pane(f, center, app);
     left_column(f, left, app);
     islands_column(f, right, app);
+    mark_wide_trailing(f.buffer_mut());
+}
+
+/// 给宽字符的尾格打上隐形标记（HIDDEN 空格）。
+///
+/// ratatui 的 diff 在"默认样式的宽字符被更窄内容替换"时不会重绘尾格，
+/// 只依赖终端自行清理被覆盖宽字符的后半格；conhost/XShell 等终端不清理，
+/// 会残留半个字的残影。尾格带上 HIDDEN 修饰后（视觉不可见、应用内无其他来源），
+/// 下一帧宽字符消失时尾格因样式不等而被强制重绘，残影随之清除。
+fn mark_wide_trailing(buf: &mut Buffer) {
+    let width = buf.area.width as usize;
+    if width == 0 {
+        return;
+    }
+    let marker = Style::new().add_modifier(Modifier::HIDDEN);
+    for y in 0..buf.area.height as usize {
+        let row_start = y * width;
+        let mut x = 0;
+        while x < width {
+            let idx = row_start + x;
+            let cell_width = buf.content[idx].cell_width().max(1) as usize;
+            for offset in 1..cell_width {
+                let trailing = idx + offset;
+                if trailing >= row_start + width {
+                    break;
+                }
+                let cell = &mut buf.content[trailing];
+                if cell.symbol().is_empty() || cell.symbol() == " " {
+                    cell.set_symbol(" ").set_style(marker);
+                }
+            }
+            x += cell_width;
+        }
+    }
 }
 
 fn placeholder(f: &mut Frame, area: Rect, title: &str, text: &str, border: Style) {
@@ -883,6 +918,51 @@ fn render_island(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_char_removal_repaints_trailing_cells() {
+        let area = Rect::new(0, 0, 20, 1);
+        let mut prev = Buffer::empty(area);
+        prev.set_string(0, 0, "F4 添加当前路径", Style::new().fg(Color::DarkGray));
+        mark_wide_trailing(&mut prev);
+
+        let mut next = Buffer::empty(area);
+        next.set_string(0, 0, "free -h", Style::new());
+        mark_wide_trailing(&mut next);
+
+        let diff = prev.diff(&next);
+        // "前/路/径" 的尾格（列 10/12/14）在新帧中是默认空白，
+        // 不打标记时 diff 认为相等而跳过，终端上会残留半个字的残影
+        for x in [10u16, 12, 14] {
+            assert!(
+                diff.iter().any(|(dx, _, _)| *dx == x),
+                "x={x} 是宽字符尾格，必须重绘以清除残影"
+            );
+        }
+    }
+
+    #[test]
+    fn mark_wide_trailing_marks_blank_trailing_only() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+        buf.set_string(0, 0, "目录ab", Style::new());
+        // "目"(0-1) "录"(2-3)，尾格 1/3 被 set_string 重置为默认空白
+        buf[(5, 0)].set_symbol("X");
+        mark_wide_trailing(&mut buf);
+        assert!(
+            buf[(1, 0)].modifier.contains(Modifier::HIDDEN),
+            "目 的尾格应有标记"
+        );
+        assert!(
+            buf[(3, 0)].modifier.contains(Modifier::HIDDEN),
+            "录 的尾格应有标记"
+        );
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::HIDDEN));
+        assert!(!buf[(4, 0)].modifier.contains(Modifier::HIDDEN));
+        // 非空尾格（这里模拟覆盖写入）不被改动
+        buf[(3, 0)].set_symbol("X");
+        mark_wide_trailing(&mut buf);
+        assert_eq!(buf[(3, 0)].symbol(), "X", "非空尾格不应被覆盖");
+    }
 
     #[test]
     fn paged_tab_hit_matches_label_regions() {

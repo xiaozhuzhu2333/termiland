@@ -89,7 +89,7 @@ impl IslandState {
         self.parser = vt100::Parser::new(rows, cols, ISLAND_SCROLLBACK);
         self.exited = false;
         self.armed = false;
-        self.custom_path = None;
+        // 指定路径仅在用户于路径编辑中空回车时清除，清空命令不应将其重置
         self.scroll = 0;
         self.selection = None;
     }

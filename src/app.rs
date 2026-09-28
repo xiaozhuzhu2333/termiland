@@ -1857,6 +1857,34 @@ mod tests {
     }
 
     #[test]
+    fn clearing_command_keeps_custom_path() {
+        let mut app = app_with_islands();
+        let dir = std::env::temp_dir();
+        app.islands[0].custom_path = Some(dir.to_string_lossy().into_owned());
+        app.focus = Focus::Island(0);
+
+        let mut input = Vec::new();
+        for ch in "ls".chars() {
+            app.handle_key(press_key(KeyCode::Char(ch), KeyModifiers::NONE), &mut input)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            app.handle_key(
+                press_key(KeyCode::Backspace, KeyModifiers::NONE),
+                &mut input,
+            )
+            .unwrap();
+        }
+        assert!(app.islands[0].command.is_empty());
+        assert!(app.islands[0].session.is_none(), "命令清空后岛应复位");
+        assert_eq!(
+            app.islands[0].custom_path.as_deref(),
+            Some(dir.to_string_lossy().as_ref()),
+            "清空命令不应清除指定路径，除非用户在路径编辑中手动删除"
+        );
+    }
+
+    #[test]
     fn wheel_over_island_scrolls_it() {
         let mut app = app_with_islands();
         for i in 0..100 {

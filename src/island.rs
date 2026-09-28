@@ -156,27 +156,102 @@ fn island_command_line(shell: &str, command: &str) -> String {
     }
 }
 
+fn island_shell_is_bash(shell: &str) -> bool {
+    std::path::Path::new(shell)
+        .file_name()
+        .is_some_and(|name| name == "bash")
+}
+
+fn island_rc_path() -> Option<std::path::PathBuf> {
+    let path = std::env::temp_dir().join("termiland-island-rc");
+    std::fs::write(&path, "history -r 2>/dev/null\n").ok()?;
+    Some(path)
+}
+
+fn island_argv(shell: &str, command: &str, rcfile: Option<&str>) -> Vec<String> {
+    let mut argv = vec![shell.to_owned()];
+    if island_shell_is_bash(shell)
+        && let Some(rc) = rcfile
+    {
+        argv.push("--rcfile".to_owned());
+        argv.push(rc.to_owned());
+    }
+    argv.push("-i".to_owned());
+    argv.push("-c".to_owned());
+    argv.push(island_command_line(shell, command));
+    argv
+}
+
 fn shell_command(command: &str, cwd: &std::path::Path) -> CommandBuilder {
-    let mut cmd;
     if cfg!(windows) {
-        cmd = CommandBuilder::new("cmd");
+        let mut cmd = CommandBuilder::new("cmd");
         cmd.arg("/C");
         cmd.arg(command);
+        cmd.cwd(cwd);
+        cmd
     } else {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
-        let line = island_command_line(&shell, command);
-        cmd = CommandBuilder::new(shell);
-        cmd.arg("-i");
-        cmd.arg("-c");
-        cmd.arg(line);
+        let rcfile = island_shell_is_bash(&shell)
+            .then(island_rc_path)
+            .flatten()
+            .map(|path| path.to_string_lossy().into_owned());
+        let argv: Vec<std::ffi::OsString> = island_argv(&shell, command, rcfile.as_deref())
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        let mut cmd = CommandBuilder::from_argv(argv);
+        cmd.cwd(cwd);
+        cmd
     }
-    cmd.cwd(cwd);
-    cmd
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bash_islands_use_fast_rcfile_path() {
+        assert_eq!(
+            island_argv("/bin/bash", "echo hi", Some("/tmp/termiland-island-rc")),
+            vec![
+                "/bin/bash".to_owned(),
+                "--rcfile".to_owned(),
+                "/tmp/termiland-island-rc".to_owned(),
+                "-i".to_owned(),
+                "-c".to_owned(),
+                "history -r 2>/dev/null; echo hi".to_owned(),
+            ],
+            "bash 岛应跳过重量级 .bashrc，仅预载历史（--rcfile 须为独立参数且在 -i 前）"
+        );
+        assert_eq!(
+            island_argv("/bin/bash", "echo hi", None),
+            vec![
+                "/bin/bash".to_owned(),
+                "-i".to_owned(),
+                "-c".to_owned(),
+                "history -r 2>/dev/null; echo hi".to_owned(),
+            ],
+            "rcfile 不可用时退回普通交互模式"
+        );
+        assert_eq!(
+            island_argv("/bin/zsh", "echo hi", Some("/tmp/rc")),
+            vec![
+                "/bin/zsh".to_owned(),
+                "-i".to_owned(),
+                "-c".to_owned(),
+                "echo hi".to_owned(),
+            ],
+            "非 bash 不使用 --rcfile"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn island_rc_file_contains_history_preload() {
+        let path = island_rc_path().expect("临时目录应可写");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "history -r 2>/dev/null\n");
+    }
 
     #[test]
     fn sanitize_destroys_dangling_wide_at_boundary() {
@@ -234,10 +309,11 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(argv[0], shell, "岛应与终端同源解析 shell");
-        assert_eq!(
-            argv[1..3],
-            ["-i".to_owned(), "-c".to_owned()],
-            "岛应以交互模式运行命令"
+        let i_pos = argv.iter().position(|a| a == "-i");
+        let c_pos = argv.iter().position(|a| a == "-c");
+        assert!(
+            i_pos.is_some_and(|i| i > 0 && c_pos.is_some_and(|c| c > i)),
+            "岛应以交互模式运行命令: {argv:?}"
         );
         assert!(
             argv.last().is_some_and(|a| a.ends_with("echo hi")),

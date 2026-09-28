@@ -149,7 +149,7 @@ fn is_copy_shortcut(key: &KeyEvent) -> bool {
 #[cfg(windows)]
 fn is_paste_shortcut(key: &KeyEvent) -> bool {
     match key.code {
-        KeyCode::Char('v') | KeyCode::Char('V') => key.modifiers == KeyModifiers::ALT,
+        KeyCode::Char('v') | KeyCode::Char('V') => key.modifiers == KeyModifiers::CONTROL,
         KeyCode::Insert => key.modifiers == KeyModifiers::SHIFT,
         _ => false,
     }
@@ -2760,19 +2760,30 @@ mod tests {
     fn paste_shortcut_matches_only_exact_combos() {
         assert!(is_paste_shortcut(&press_key(
             KeyCode::Char('v'),
-            KeyModifiers::ALT
+            KeyModifiers::CONTROL
         )));
         assert!(is_paste_shortcut(&press_key(
-            KeyCode::Insert,
-            KeyModifiers::SHIFT
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL
         )));
         assert!(!is_paste_shortcut(&press_key(
             KeyCode::Char('v'),
             KeyModifiers::NONE
         )));
         assert!(!is_paste_shortcut(&press_key(
-            KeyCode::Char('V'),
-            KeyModifiers::ALT | KeyModifiers::SHIFT
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert!(
+            !is_paste_shortcut(&press_key(
+                KeyCode::Char('v'),
+                KeyModifiers::ALT
+            )),
+            "Alt+V 被 XShell 菜单加速器吃掉，已放弃"
+        );
+        assert!(is_paste_shortcut(&press_key(
+            KeyCode::Insert,
+            KeyModifiers::SHIFT
         )));
         assert!(!is_paste_shortcut(&press_key(
             KeyCode::Insert,

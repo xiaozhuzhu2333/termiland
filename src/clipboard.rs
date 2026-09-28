@@ -52,6 +52,13 @@ pub fn copy(text: &str) -> bool {
     }
 }
 
+#[cfg(windows)]
+pub fn paste() -> Option<String> {
+    arboard::Clipboard::new()
+        .and_then(|mut clipboard| clipboard.get_text())
+        .ok()
+}
+
 #[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;

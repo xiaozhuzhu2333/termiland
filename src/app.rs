@@ -146,6 +146,15 @@ fn is_copy_shortcut(key: &KeyEvent) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn is_paste_shortcut(key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('v') | KeyCode::Char('V') => key.modifiers == KeyModifiers::ALT,
+        KeyCode::Insert => key.modifiers == KeyModifiers::SHIFT,
+        _ => false,
+    }
+}
+
 fn is_backspace(key: &KeyEvent) -> bool {
     (key.code == KeyCode::Backspace && key.modifiers.is_empty())
         || (key.code == KeyCode::Char('h') && key.modifiers == KeyModifiers::CONTROL)
@@ -424,23 +433,7 @@ impl App {
         loop {
             match event::read()? {
                 Event::Key(key) => self.handle_key(key, &mut input)?,
-                Event::Paste(text) => {
-                    let line: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
-                    if let Some((_, buffer)) = &mut self.island_path_edit {
-                        buffer.push_str(&line);
-                    } else if self.panel_input.is_some() {
-                        if let Some(buffer) = &mut self.panel_input {
-                            buffer.push_str(&line);
-                        }
-                    } else {
-                        match self.focus {
-                            Focus::Island(_) => {
-                                self.edit_focused_command(Some(&line));
-                            }
-                            Focus::Terminal => input.extend_from_slice(&keys::paste_bytes(&text)),
-                        }
-                    }
-                }
+                Event::Paste(text) => self.paste_text(&text, &mut input),
                 Event::Mouse(mouse) => self.handle_mouse(mouse)?,
                 _ => {}
             }
@@ -452,6 +445,31 @@ impl App {
             self.send_terminal_input(&input)?;
         }
         Ok(())
+    }
+
+    fn paste_text(&mut self, text: &str, input: &mut Vec<u8>) {
+        if text.is_empty() {
+            return;
+        }
+        let line: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+        if let Some((_, buffer)) = &mut self.island_path_edit {
+            buffer.push_str(&line);
+        } else if let Some(buffer) = &mut self.panel_input {
+            buffer.push_str(&line);
+        } else {
+            match self.focus {
+                Focus::Island(_) => self.edit_focused_command(Some(&line)),
+                Focus::Terminal => input.extend_from_slice(&keys::paste_bytes(text)),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn paste_from_clipboard(&mut self, input: &mut Vec<u8>) {
+        match crate::clipboard::paste() {
+            Some(text) => self.paste_text(&text, input),
+            None => self.notify("粘贴失败（无法读取剪贴板）".to_owned(), NoticeKind::Warn),
+        }
     }
 
     fn send_terminal_input(&mut self, input: &[u8]) -> Result<()> {
@@ -469,6 +487,11 @@ impl App {
             return Ok(());
         }
         let is_press = key.kind == KeyEventKind::Press;
+        #[cfg(windows)]
+        if is_press && is_paste_shortcut(&key) {
+            self.paste_from_clipboard(input);
+            return Ok(());
+        }
         if is_press && self.island_path_edit.is_some() {
             self.handle_island_path_key(key);
             return Ok(());
@@ -2702,6 +2725,64 @@ mod tests {
         )
         .unwrap();
         assert!(!input.is_empty(), "无选区时 Ctrl+Insert 应透传给 shell");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn paste_shortcut_matches_only_exact_combos() {
+        assert!(is_paste_shortcut(&press_key(
+            KeyCode::Char('v'),
+            KeyModifiers::ALT
+        )));
+        assert!(is_paste_shortcut(&press_key(
+            KeyCode::Insert,
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_paste_shortcut(&press_key(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_paste_shortcut(&press_key(
+            KeyCode::Char('V'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT
+        )));
+        assert!(!is_paste_shortcut(&press_key(
+            KeyCode::Insert,
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_paste_shortcut(&press_key(
+            KeyCode::Insert,
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn paste_text_routes_by_context() {
+        let mut app = app_with_islands();
+        let mut input = Vec::new();
+
+        app.paste_text("a\r\nb", &mut input);
+        assert_eq!(input, b"a\rb".to_vec(), "终端焦点时规范化换行后写入 PTY");
+
+        app.focus = Focus::Island(0);
+        app.paste_text("cmd one", &mut input);
+        assert_eq!(app.islands[0].command, "cmd one");
+        assert_eq!(input, b"a\rb".to_vec(), "Island 焦点时不应写入 PTY");
+
+        app.paste_text("x\ny", &mut input);
+        assert_eq!(
+            app.islands[0].command, "cmd onexy",
+            "命令缓冲粘贴应去除换行"
+        );
+
+        app.island_path_edit = Some((0, String::new()));
+        app.paste_text("/tmp", &mut input);
+        assert_eq!(app.island_path_edit, Some((0, "/tmp".to_owned())));
+
+        app.island_path_edit = None;
+        app.panel_input = Some(String::new());
+        app.paste_text("note", &mut input);
+        assert_eq!(app.panel_input, Some("note".to_owned()));
     }
 
     #[test]

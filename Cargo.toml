@@ -15,3 +15,7 @@ vt100 = "0.16.2"
 
 [target.'cfg(windows)'.dependencies]
 arboard = "3.6.1"
+
+[package.metadata.release]
+tag-name = "v{{version}}"
+publish = false
